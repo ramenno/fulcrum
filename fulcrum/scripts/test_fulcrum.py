@@ -293,6 +293,48 @@ assert is_tpu_machine('g2-standard-48') is False
     assert data_8t["memory_budget"]["effective_max_model_len"] == 8192
     assert "--max-model-len=8192" in data_8t["commands"]["upload_model"]
 
+    # 17. Test extract_operation_id_from_output helper
+    from fulcrum.scripts.launch_gcp import extract_operation_id_from_output, poll_vertex_operation
+    s1 = "Operation [projects/123/locations/europe-west4/operations/1810106235958067200] has not finished in 1800 seconds"
+    assert extract_operation_id_from_output(s1) == "1810106235958067200"
+    s2 = '{"name": "projects/my-proj/locations/us-central1/operations/998877665544332211"}'
+    assert extract_operation_id_from_output(s2) == "998877665544332211"
+    s3 = "1810106235958067200"
+    assert extract_operation_id_from_output(s3) == "1810106235958067200"
+    assert extract_operation_id_from_output("") is None
+    assert extract_operation_id_from_output(None) is None
+
+    # 18. Test poll_vertex_operation with mock responses
+    import unittest.mock as mock
+
+    # Mock successful completion
+    mock_success = mock.MagicMock()
+    mock_success.returncode = 0
+    mock_success.stdout = json.dumps({"done": True, "response": {"deployedModel": {"id": "12345"}}})
+
+    with mock.patch("subprocess.run", return_value=mock_success):
+        res = poll_vertex_operation("1810106235958067200", "test-proj", "europe-west4", timeout_seconds=10, interval_seconds=1, max_poll_iterations=1)
+        assert res.get("done") is True
+
+    # Mock failure error
+    mock_fail = mock.MagicMock()
+    mock_fail.returncode = 0
+    mock_fail.stdout = json.dumps({"done": True, "error": {"code": 8, "message": "Resource exhausted"}})
+
+    with mock.patch("subprocess.run", return_value=mock_fail):
+        try:
+            poll_vertex_operation("1810106235958067200", "test-proj", "europe-west4", timeout_seconds=10, interval_seconds=1, max_poll_iterations=1)
+            assert False, "Expected RuntimeError on operation failure"
+        except RuntimeError as e:
+            assert "Resource exhausted" in str(e)
+
+    # 19. Test async deploy command generated in launch_gcp dry-run
+    p_async_cmd = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model google/gemma-3-12b-it --format json")
+    data_async = json.loads(p_async_cmd.stdout)
+    deploy_cmd = data_async["commands"]["deploy_model"]
+    assert "Option B: Asynchronous REST API dispatch" in deploy_cmd
+    assert "gcloud ai operations describe" in deploy_cmd
+
     if os.path.exists(test_db):
         os.remove(test_db)
     print("launch_gcp.py: PASSED")
@@ -318,6 +360,7 @@ def test_status_deployment() -> None:
             "machine_type": "g2-standard-8",
             "accelerator": "NVIDIA_L4",
             "gpu_count": 1,
+            "operation_id": "1810106235958067200",
             "status": "RECORDED",
             "created_at": "2026-09-09T00:00:00Z",
         },
@@ -351,11 +394,13 @@ def test_status_deployment() -> None:
     data = json.loads(p_json.stdout)
     assert len(data) == 2
     assert data[0]["platform"] == "vertex"
+    assert data[0]["operation_id"] == "1810106235958067200"
     assert data[1]["platform"] == "gce"
 
-    # Test verbose diagnostics for Vertex
+    # Test verbose diagnostics for Vertex (including Operation ID display)
     p_verb = run(".venv/bin/python3 fulcrum/scripts/status_deployment.py --id fulcrum-gemma-3-12b-it --verbose", env_vars={"FULCRUM_DB_PATH": test_db})
     assert "Vertex Predict URI" in p_verb.stdout
+    assert "1810106235958067200" in p_verb.stdout
 
     if os.path.exists(test_db):
         os.remove(test_db)

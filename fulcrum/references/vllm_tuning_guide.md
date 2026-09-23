@@ -140,6 +140,42 @@ For models with extreme context windows (e.g. Kimi K3 with 200k+ tokens or DeepS
 - **Automatic Dynamic Clamping**:
   If the model's requested sequence length exceeds $\text{Max Safe Context}$, Fulcrum automatically clamps `--max-model-len` to the highest safe standard power-of-2 context (e.g. 4096) and sets `--gpu-memory-utilization 0.90` dynamically, preventing hours of failed container warmup cycles.
 
+### 8. Decoupling Vertex Deployment from the 30-Minute Client Timeout
+- **The Issue Encountered**:
+  Large models (27B–70B+) on Cloud TPU or multi-GPU topologies require image container pull, streaming 50+ GiB of weights from Hugging Face or Cloud Storage, and Ahead-Of-Time (AOT) JAX/XLA graph compilation across multiple sequence buckets (`128`, `256`, `512`, `1024`, `2048`, `4096`).
+  Total container warmup routinely takes 35 to 45 minutes. At the 30-minute mark, synchronous `gcloud ai endpoints deploy-model` terminates with a client socket timeout:
+  ```text
+  Operation [projects/.../locations/.../operations/1810106235958067200] has not finished in 1800 seconds
+  ```
+  An uninformed agent or user might assume this was an infrastructure failure and cancel the operation, even though the remote operation was progressing smoothly. Furthermore, `gcloud ai endpoints deploy-model` does **not** support an `--async` flag (`unrecognized arguments: --async`).
+- **Asynchronous REST Dispatch**:
+  To decouple client orchestration from the 30-minute client socket timeout, Fulcrum dispatches deployments asynchronously via the Vertex AI REST API:
+  ```bash
+  curl -s -X POST \
+      -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+      -H "Content-Type: application/json" \
+      "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT}/locations/${REGION}/endpoints/${ENDPOINT_ID}:deployModel" \
+      -d '{
+        "deployedModel": {
+          "model": "projects/'"${PROJECT}"'/locations/'"${REGION}"'/models/'"${MODEL_ID}"'",
+          "displayName": "'"${ENDPOINT_NAME}"'-deployed",
+          "dedicatedResources": {
+            "machineSpec": {"machineType": "'"${MACHINE_TYPE}"'"},
+            "minReplicaCount": 1,
+            "maxReplicaCount": 1
+          }
+        },
+        "trafficSplit": {"0": 100}
+      }'
+  ```
+  This returns immediately (<1 second) with the Long-Running Operation (`projects/.../operations/{op_id}`).
+- **Dedicated Operation Polling & Timeout Recovery**:
+  Fulcrum immediately records the `operation_id` in its state database and initiates a progress poller via:
+  ```bash
+  gcloud ai operations describe ${OP_ID} --project=${PROJECT} --region=${REGION} --format=json
+  ```
+  Fulcrum monitors the deployment with real-time stage updates up to 7,200 seconds (2 hours). If standard `gcloud` CLI was used and hit the 1,800s timeout, Fulcrum automatically intercepts the Operation ID from `stderr` and hands off to the operation poller without failing the workflow.
+
 
 
 

@@ -4,7 +4,7 @@ description: Fulcrum provides effortless leverage to discover, size, provision, 
 compatibility: Requires Python 3.10+, gcloud CLI, and access to GCP project with GPU or TPU quota.
 metadata:
   version: "2.0.0"
-  author: "Antigravity & Pair Programmer"
+  author: "Ramnath"
   category: "Machine Learning & Cloud Infrastructure"
 ---
 
@@ -121,7 +121,12 @@ Use `/fulcrum run` to provision and launch a downloadable open-weight model on G
      $$\text{KV Memory Per Token} = 2 \times \text{layers} \times \text{kv\_heads} \times \text{head\_dim} \times \text{bytes\_per\_elem}$$
      $$\text{Max Safe Context} = \left\lfloor \frac{\text{Total HBM} \times \text{utilization} - \text{Weight Memory} - \text{Runtime Overhead}}{\text{Effective KV Memory Per Token}} \right\rfloor$$
    - If the model's requested sequence length exceeds $\text{Max Safe Context}$, Fulcrum automatically clamps `--max-model-len` to the highest safe standard power-of-2 context (e.g. 4096 on `ct6e-standard-4t` for 32B models) and dynamically sets `--gpu-memory-utilization 0.90`, preventing container warmup crashes.
-4. **Direct Provisioning & Execution**:
+4. **Decoupled Asynchronous Dispatch & Operation Polling**:
+   - Large models (27B–70B+) on Cloud TPU or multi-GPU topologies require image pulling, streaming 50+ GiB of weights, and Ahead-Of-Time (AOT) JAX/XLA graph compilation, routinely taking 35–45 minutes.
+   - Synchronous `gcloud ai endpoints deploy-model` terminates at 1,800 seconds (30 minutes) with a client socket timeout and rejects `--async`.
+   - `/fulcrum run` natively dispatches deployments asynchronously via the Vertex AI REST API (`POST ...:deployModel`), capturing the Operation ID in <1 second and delegating monitoring to an internal progress poller (`gcloud ai operations describe`) with real-time stage updates up to 7,200s (2 hours).
+   - If standard `gcloud` CLI hits the 1,800s timeout, Fulcrum automatically intercepts the active Operation ID from stderr and seamlessly hands off to the operation poller without aborting.
+5. **Direct Provisioning & Execution**:
    When the necessary deployment parameters are known (model identifier, platform, quantisation, and GCP project), `/fulcrum run` proceeds immediately with execution on Google Cloud Platform without requiring confirmation prompts or an `--execute` flag:
    ```bash
    # Standard GPU deployment on Vertex AI (executes immediately)
@@ -137,7 +142,7 @@ Use `/fulcrum run` to provision and launch a downloadable open-weight model on G
    .venv/bin/python3 fulcrum/scripts/launch_gcp.py --model <huggingface-id> --platform gce
    ```
    Add `--record` to register the planned deployment into the local state database immediately.
-5. **Dry-Run & Infrastructure-as-Code Generation**:
+6. **Dry-Run & Infrastructure-as-Code Generation**:
    If the user specifically requests a preview of deployment commands without provisioning infrastructure, or requests Terraform/JSON definitions, pass `--dry-run` or `--format`:
    ```bash
    # Dry-run inspection without provisioning
@@ -147,7 +152,7 @@ Use `/fulcrum run` to provision and launch a downloadable open-weight model on G
    .venv/bin/python3 fulcrum/scripts/launch_gcp.py --model <huggingface-id> --format terraform
    ```
    Add `--record` to register the planned deployment into the local state database in dry-run mode.
-6. **Hardware Reference**:
+7. **Hardware Reference**:
    Consult [references/gcp_hardware_matrix.md](references/gcp_hardware_matrix.md) for Vertex machine mappings (GPUs and TPUs) and pricing comparisons.
 
 ---

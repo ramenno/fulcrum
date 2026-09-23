@@ -157,6 +157,7 @@ Key automated capabilities:
 - **Pre-Flight KV-Cache & HBM Memory Sizing**: Before deployment, Fulcrum computes available accelerator memory against requested context length:
   $$\text{Max Safe Context} = \left\lfloor \frac{\text{Total HBM} \times \text{utilization} - \text{Weight Memory} - \text{Runtime Overhead}}{\text{Effective KV Memory Per Token}} \right\rfloor$$
   If requested context exceeds safe capacity, Fulcrum automatically clamps `--max-model-len` (e.g. to 4096 on `ct6e-standard-4t` for 32B models) and sets `--gpu-memory-utilization 0.90` dynamically, preventing container warmup crashes.
+- **Decoupled Asynchronous Dispatch & Operation Poller**: Large models (27B–70B+) on Cloud TPU or multi-GPU instances require image pulling, 50+ GiB weight streaming, and Ahead-Of-Time (AOT) JAX/XLA compilation, taking 35–45 minutes. Synchronous `gcloud ai endpoints deploy-model` terminates at 1,800s (30m) with a client socket timeout. Fulcrum natively dispatches deployments asynchronously via the Vertex AI REST API (`POST ...:deployModel`), records the Operation ID in <1 second, and hands off to an internal progress poller (`gcloud ai operations describe`) with real-time stage updates up to 7,200s (2 hours). If standard `gcloud` CLI hits the 1,800s timeout, Fulcrum intercepts the Operation ID from stderr and seamlessly recovers.
 
 ```bash
 # Provision on Vertex AI Endpoint directly (executes immediately)

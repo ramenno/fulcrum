@@ -17,6 +17,9 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -266,6 +269,183 @@ def evaluate_platform_viability(
     )
 
 
+def extract_operation_id_from_output(text: str) -> Optional[str]:
+    """
+    Extracts Vertex AI Operation ID or full operation resource name from command output.
+    Handles standard gcloud operation notifications, e.g.:
+      - Operation [projects/123/locations/europe-west4/operations/1810106235958067200] has not finished in 1800 seconds
+      - Operation [projects/123/locations/us-central1/operations/1810106235958067200] is in progress.
+      - {"name": "projects/123/locations/europe-west4/operations/1810106235958067200"}
+    """
+    if not text:
+        return None
+    # Match standard Vertex AI operations/<id> pattern
+    m = re.search(r"operations/([0-9]+)", text)
+    if m:
+        return m.group(1)
+    # Match standalone 16-22 digit operation ID
+    m2 = re.search(r"\b([0-9]{16,22})\b", text)
+    if m2:
+        return m2.group(1)
+    return None
+
+
+def dispatch_vertex_deploy_model_async(
+    project: str,
+    region: str,
+    endpoint_id: str,
+    model_id: str,
+    display_name: str,
+    machine_type: str,
+    vertex_accel: Optional[str] = None,
+    gpu_count: int = 1,
+    is_tpu: bool = False,
+    access_token: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Dispatches Vertex AI model deployment asynchronously via REST API.
+    Bypasses gcloud's 1,800s client socket timeout by immediately returning the Operation ID.
+    Returns: (operation_name, operation_id) or (None, None) on failure.
+    """
+    token = access_token
+    if not token:
+        try:
+            p = subprocess.run(
+                ["gcloud", "auth", "print-access-token"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            if p.returncode == 0 and p.stdout.strip():
+                token = p.stdout.strip()
+        except Exception:
+            token = None
+
+    if not token:
+        return None, None
+
+    machine_spec: Dict[str, Any] = {"machineType": machine_type}
+    if not is_tpu and vertex_accel:
+        machine_spec["acceleratorType"] = vertex_accel.upper().replace("-", "_")
+        machine_spec["acceleratorCount"] = int(gpu_count)
+
+    payload = {
+        "deployedModel": {
+            "model": f"projects/{project}/locations/{region}/models/{model_id}",
+            "displayName": display_name,
+            "dedicatedResources": {
+                "machineSpec": machine_spec,
+                "minReplicaCount": 1,
+                "maxReplicaCount": 1,
+            },
+        },
+        "trafficSplit": {
+            "0": 100,
+        },
+    }
+
+    url = f"https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/endpoints/{endpoint_id}:deployModel"
+    req_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=req_data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            op_name = data.get("name", "")
+            op_id = extract_operation_id_from_output(op_name)
+            return op_name, op_id
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8") if e.fp else ""
+        print(f"Notice: Async deployModel API returned HTTP {e.code}: {err_body}", file=sys.stderr)
+        return None, None
+    except Exception as e:
+        print(f"Notice: Async deployModel dispatch failed: {e}", file=sys.stderr)
+        return None, None
+
+
+def poll_vertex_operation(
+    operation_id: str,
+    project: str,
+    region: str,
+    timeout_seconds: int = 7200,
+    interval_seconds: int = 15,
+    logger_func=print,
+    max_poll_iterations: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Polls a Vertex AI Long-Running Operation (LRO) until completion or timeout.
+    Decoupled from gcloud's 1,800s client socket timeout, providing real-time stage telemetry.
+    Raises RuntimeError on operation failure or TimeoutError on timeout.
+    """
+    start_time = time.time()
+    op_num = operation_id.split("/")[-1]
+    logger_func(f"🚀 [ASYNC DEPLOYMENT DISPATCHED]: Handed off monitoring to operation poller for Operation ID: {op_num}")
+    logger_func(f"   Monitoring endpoint deployment (timeout: {timeout_seconds // 60}m, poll interval: {interval_seconds}s)...")
+
+    iterations = 0
+    while True:
+        if max_poll_iterations is not None and iterations >= max_poll_iterations:
+            break
+
+        elapsed = int(time.time() - start_time)
+        if elapsed > timeout_seconds:
+            raise TimeoutError(
+                f"Vertex AI deployment operation {op_num} exceeded timeout limit of {timeout_seconds} seconds ({timeout_seconds // 60}m)."
+            )
+
+        mins = elapsed // 60
+        secs = elapsed % 60
+        time_str = f"{mins}m {secs:02d}s"
+
+        cmd = [
+            "gcloud", "ai", "operations", "describe", op_num,
+            f"--project={project}", f"--region={region}",
+            "--format=json",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        op_data = {}
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                op_data = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                op_data = {}
+
+        if op_data:
+            is_done = op_data.get("done", False)
+            if is_done:
+                err = op_data.get("error")
+                if err:
+                    err_msg = err.get("message", "Unknown Google Cloud error")
+                    err_code = err.get("code", "UNKNOWN")
+                    raise RuntimeError(
+                        f"Vertex AI deployment operation {op_num} FAILED [Code {err_code}]: {err_msg}"
+                    )
+                logger_func(f"✅ [DEPLOYMENT COMPLETE]: Operation {op_num} finished successfully in {time_str}!")
+                return op_data
+
+            meta = op_data.get("metadata", {})
+            state = meta.get("genericMetadata", {}).get("state", "RUNNING")
+            logger_func(f"   ⏱️  [Elapsed: {time_str}] Operation {op_num} in progress... (State: {state})")
+        else:
+            logger_func(f"   ⏱️  [Elapsed: {time_str}] Operation {op_num} in progress... (polling Vertex AI API)")
+
+        iterations += 1
+        if max_poll_iterations is not None and iterations >= max_poll_iterations:
+            return op_data
+
+        time.sleep(interval_seconds)
+    return {}
+
+
 def generate_vertex_commands(
     endpoint_name: str,
     model_id: str,
@@ -367,10 +547,20 @@ def generate_vertex_commands(
         f'    --format="value(model)")'
     )
 
+    # Precompute REST payload for Option B asynchronous dispatch
+    rest_accel = f', "acceleratorType": "{vertex_accel}", "acceleratorCount": {gpu_count}' if not is_tpu else ""
+    rest_payload = (
+        f'{{"deployedModel": {{"model": "projects/{project}/locations/{region}/models/${{MODEL_ID}}", '
+        f'"displayName": "{endpoint_name}-deployed", '
+        f'"dedicatedResources": {{"machineSpec": {{"machineType": "{machine_type}"{rest_accel}}}, '
+        f'"minReplicaCount": 1, "maxReplicaCount": 1}}}}, "trafficSplit": {{"0": 100}}}}'
+    )
+
     # Cardinal Rule: Do NOT pass --accelerator when machine_type is a TPU (ct*), as accelerators are hardwired.
     accel_flag = "" if is_tpu else f"    --accelerator=type={vertex_accel},count={gpu_count} \\\n"
 
     deploy_model_cmd = (
+        f"# Option A: Standard gcloud CLI deployment\n"
         f"gcloud ai endpoints deploy-model ${{ENDPOINT_ID}} \\\n"
         f"    --project={project} \\\n"
         f"    --region={region} \\\n"
@@ -380,7 +570,16 @@ def generate_vertex_commands(
         f"{accel_flag}"
         f"    --min-replica-count=1 \\\n"
         f"    --max-replica-count=1 \\\n"
-        f"    --traffic-split=0=100"
+        f"    --traffic-split=0=100\n\n"
+        f"# Option B: Asynchronous REST API dispatch (decoupled from 1,800s client socket timeout)\n"
+        f'DEPLOY_OP=$(curl -s -X POST \\\n'
+        f'    -H "Authorization: Bearer $(gcloud auth print-access-token)" \\\n'
+        f'    -H "Content-Type: application/json" \\\n'
+        f'    "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/endpoints/${{ENDPOINT_ID}}:deployModel" \\\n'
+        f"    -d '{rest_payload}' | grep -o '\"name\": \"[^\"]*' | cut -d'\"' -f4)\n"
+        f'echo "Operation ID: ${{DEPLOY_OP##*/}}"\n'
+        f'# Track operation status beyond 1,800s:\n'
+        f'gcloud ai operations describe ${{DEPLOY_OP##*/}} --project={project} --region={region}'
     )
 
     sample_request = (
@@ -1263,23 +1462,84 @@ Examples:
                 print(f"Uploaded Model ID: {model_id}")
             record_data["vertex_model_id"] = model_id
 
-            print("Step 3: Deploying model to endpoint...")
-            # Cardinal Rule: Do NOT pass --accelerator when deploying to a TPU machine type (ct*).
-            accel_param = "" if is_tpu else f"--accelerator=type={gpu_type.lower()},count={gpu_count} "
-            deploy_cmd = (
-                f"gcloud ai endpoints deploy-model {ep_id} "
-                f"--project={project} "
-                f"--region={region} "
-                f"--model={model_id} "
-                f"--display-name={resource_name}-deployed "
-                f"--machine-type={machine_type} "
-                f"{accel_param}"
-                f"--min-replica-count=1 "
-                f"--max-replica-count=1 "
-                f"--traffic-split=0=100"
+            print("Step 3: Deploying model to endpoint (Asynchronous Dispatch)...")
+            # 1. Attempt asynchronous REST API dispatch to decouple from gcloud's 1,800s client socket timeout
+            op_name, op_id = dispatch_vertex_deploy_model_async(
+                project=project,
+                region=region,
+                endpoint_id=ep_id,
+                model_id=model_id,
+                display_name=f"{resource_name}-deployed",
+                machine_type=machine_type,
+                vertex_accel=vertex_accel,
+                gpu_count=gpu_count,
+                is_tpu=is_tpu,
             )
-            res3 = subprocess.run(deploy_cmd, shell=True, check=False)
-            res3_code = res3.returncode
+
+            res3_code = 1
+            if op_id:
+                record_data["operation_id"] = op_id
+                record_data["status"] = "DEPLOYING"
+                db.add_deployment(record_data)
+                try:
+                    poll_vertex_operation(
+                        operation_id=op_id,
+                        project=project,
+                        region=region,
+                        timeout_seconds=timeout_sec,
+                    )
+                    res3_code = 0
+                except Exception as e:
+                    print(f"\nDeployment error during operation polling: {e}", file=sys.stderr)
+                    res3_code = 1
+            else:
+                # 2. Resilient CLI fallback: invoke gcloud and intercept any 1,800s client timeout
+                print("Notice: Dispatching via gcloud CLI with automatic 1,800s timeout interception...")
+                accel_param = "" if is_tpu else f"--accelerator=type={gpu_type.lower()},count={gpu_count} "
+                deploy_cmd = (
+                    f"gcloud ai endpoints deploy-model {ep_id} "
+                    f"--project={project} "
+                    f"--region={region} "
+                    f"--model={model_id} "
+                    f"--display-name={resource_name}-deployed "
+                    f"--machine-type={machine_type} "
+                    f"{accel_param}"
+                    f"--min-replica-count=1 "
+                    f"--max-replica-count=1 "
+                    f"--traffic-split=0=100"
+                )
+                res3 = subprocess.run(deploy_cmd, shell=True, capture_output=True, text=True, check=False)
+                combined_output = f"{res3.stdout}\n{res3.stderr}"
+                if res3.stdout:
+                    print(res3.stdout)
+
+                if res3.returncode == 0:
+                    res3_code = 0
+                else:
+                    # Check if gcloud exited due to the 1,800s client timeout:
+                    # "Operation [projects/.../operations/<id>] has not finished in 1800 seconds"
+                    recovered_op_id = extract_operation_id_from_output(combined_output)
+                    if recovered_op_id:
+                        print(f"\nℹ️  [TIMEOUT RECOVERY]: Intercepted active Vertex Operation ID {recovered_op_id} from gcloud client timeout.")
+                        print(f"   Decoupling from client socket timeout and handing off to operation poller...")
+                        record_data["operation_id"] = recovered_op_id
+                        record_data["status"] = "DEPLOYING"
+                        db.add_deployment(record_data)
+                        try:
+                            poll_vertex_operation(
+                                operation_id=recovered_op_id,
+                                project=project,
+                                region=region,
+                                timeout_seconds=timeout_sec,
+                            )
+                            res3_code = 0
+                        except Exception as e:
+                            print(f"\nDeployment error during operation polling: {e}", file=sys.stderr)
+                            res3_code = 1
+                    else:
+                        if res3.stderr:
+                            print(res3.stderr, file=sys.stderr)
+                        res3_code = res3.returncode
 
             if res1_code == 0 and res2_code == 0 and res3_code == 0:
                 record_data["status"] = "RUNNING"

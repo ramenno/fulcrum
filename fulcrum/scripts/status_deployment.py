@@ -60,6 +60,42 @@ def query_vertex_status(endpoint_name: str, region: str, project: str) -> Tuple[
     return "UNKNOWN", None, None
 
 
+def query_vertex_operation(operation_id: str, region: str, project: str) -> Tuple[str, bool, Optional[str]]:
+    """Queries Vertex AI operation via gcloud ai operations describe to check completion status."""
+    op_num = operation_id.split("/")[-1]
+    try:
+        proc = subprocess.run(
+            [
+                "gcloud",
+                "ai",
+                "operations",
+                "describe",
+                op_num,
+                f"--region={region}",
+                f"--project={project}",
+                "--format=json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout)
+            is_done = data.get("done", False)
+            if is_done:
+                err = data.get("error")
+                if err:
+                    return "FAILED", True, err.get("message")
+                return "SUCCEEDED", True, None
+            meta = data.get("metadata", {})
+            state = meta.get("genericMetadata", {}).get("state", "RUNNING")
+            return state, False, None
+    except Exception:
+        pass
+    return "UNKNOWN", False, None
+
+
 def query_gce_status(instance_name: str, zone: str, project: str) -> Tuple[str, Optional[str]]:
     """Queries GCP Compute Engine via gcloud to retrieve live VM status and external IP."""
     try:
@@ -160,20 +196,38 @@ def inspect_deployment(deployment: Dict[str, Any]) -> Dict[str, Any]:
     # 1. Vertex AI Endpoint Inspection
     if platform == "vertex":
         vertex_state, deployed_id, predict_uri = query_vertex_status(name, region, project)
+        operation_id = deployment.get("operation_id")
+        op_state = None
+        op_done = False
+        op_err = None
+
+        if operation_id and vertex_state != "ACTIVE":
+            op_state, op_done, op_err = query_vertex_operation(operation_id, region, project)
+            if not op_done and op_state in ("RUNNING", "PENDING"):
+                vertex_state = "PROVISIONING"
+            elif op_done and op_state == "FAILED":
+                vertex_state = "FAILED"
+
         live_status = vertex_state if vertex_state != "UNKNOWN" else deployment.get("status", "RECORDED")
+        updates: Dict[str, Any] = {}
         if deployed_id and deployed_id != deployment.get("deployed_model_id"):
-            db.update_deployment(record_id, {"deployed_model_id": deployed_id, "status": live_status})
-        elif vertex_state != "UNKNOWN" and vertex_state != deployment.get("status"):
-            db.update_deployment(record_id, {"status": live_status})
+            updates["deployed_model_id"] = deployed_id
+        if live_status != deployment.get("status"):
+            updates["status"] = live_status
+        if updates:
+            db.update_deployment(record_id, updates)
 
         return {
             **deployment,
             "platform": "vertex",
             "live_status": live_status,
+            "operation_id": operation_id,
+            "operation_state": op_state,
+            "operation_error": op_err,
             "deployed_model_id": deployed_id or deployment.get("deployed_model_id"),
             "predict_uri": predict_uri or deployment.get("predict_uri"),
             "vllm_metrics": {
-                "health": "MANAGED" if live_status == "ACTIVE" else "INITIALIZING",
+                "health": "MANAGED" if live_status == "ACTIVE" else ("PROVISIONING" if live_status == "PROVISIONING" else "INITIALIZING"),
                 "kv_cache_usage_pct": None,
                 "requests_running": 0,
                 "requests_waiting": 0,
@@ -284,6 +338,12 @@ def print_verbose_details(inspections: List[Dict[str, Any]]) -> None:
             reg = item.get("region", "us-central1")
             proj = item.get("project", "PROJECT_ID")
             uri = item.get("predict_uri") or f"https://{reg}-aiplatform.googleapis.com/v1/projects/{proj}/locations/{reg}/endpoints/{name}:predict"
+            if item.get("operation_id"):
+                print(f"  Operation ID:      {item.get('operation_id')}")
+            if item.get("operation_state"):
+                print(f"  Operation State:   {item.get('operation_state')}")
+            if item.get("operation_error"):
+                print(f"  Operation Error:   {item.get('operation_error')}")
             print(f"  Vertex Predict URI: {uri}")
             print(f"  Curl Test (IAM OAuth2):")
             print(f"    curl -X POST \\")
