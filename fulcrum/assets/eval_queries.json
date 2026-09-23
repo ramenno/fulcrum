@@ -1,0 +1,122 @@
+[
+  {
+    "query": "Find the best open weight coding model that can run on an NVIDIA L4 GPU on GCP",
+    "should_trigger": true,
+    "rationale": "Directly requests open-weight model discovery and hardware mapping for GCP."
+  },
+  {
+    "query": "Find an open weight downloadable LLM for summarisation that I can self-deploy with vLLM on GCP",
+    "should_trigger": true,
+    "rationale": "Directly requests open-weight downloadable model discovery for self-hosting with vLLM on GCP."
+  },
+  {
+    "query": "How much VRAM do I need to serve Gemma 3 12B in BF16 vs FP8?",
+    "should_trigger": true,
+    "rationale": "Asks for open-weight model memory calculation covered by /fulcrum find."
+  },
+  {
+    "query": "Deploy meta-llama/Llama-3.1-8B-Instruct on Google Cloud using vLLM",
+    "should_trigger": true,
+    "rationale": "Direct request to launch an open-weight model on GCP via /fulcrum run (targeting Vertex AI Endpoint by default)."
+  },
+  {
+    "query": "Deploy google/gemma-3-12b-it on a Vertex AI Endpoint with vLLM",
+    "should_trigger": true,
+    "rationale": "Direct request to deploy an open-weight model on Vertex AI Endpoint handled by /fulcrum run."
+  },
+  {
+    "query": "Launch a g2-standard-8 instance on GCP with vLLM to host Qwen 2.5 Coder",
+    "should_trigger": true,
+    "rationale": "Direct GCP deployment orchestration covered by /fulcrum run."
+  },
+  {
+    "query": "Check the status and GPU utilisation of my deployed models on GCP",
+    "should_trigger": true,
+    "rationale": "Requests deployment status and utilisation monitoring covered by /fulcrum status."
+  },
+  {
+    "query": "What is the KV cache usage and request queue depth on my running vLLM server?",
+    "should_trigger": true,
+    "rationale": "Asks for live vLLM Prometheus metrics covered by /fulcrum status."
+  },
+  {
+    "query": "Optimise my vLLM deployment flags for low latency on an A100 GPU",
+    "should_trigger": true,
+    "rationale": "Inference parameter tuning request addressed by /fulcrum optimise advise."
+  },
+  {
+    "query": "Benchmark my running vLLM server at http://34.12.34.56:8000/v1 for TTFT and TPOT",
+    "should_trigger": true,
+    "rationale": "Performance benchmarking request addressed by /fulcrum optimise benchmark."
+  },
+  {
+    "query": "Delete the Vertex AI Endpoint and undeploy the model created by fulcrum",
+    "should_trigger": true,
+    "rationale": "Requests Vertex AI resource teardown covered by /fulcrum delete."
+  },
+  {
+    "query": "Delete the Compute Engine instance and firewall rules created by /fulcrum",
+    "should_trigger": true,
+    "rationale": "Requests resource deprovisioning and teardown covered by /fulcrum delete."
+  },
+  {
+    "query": "Tear down all deployed open-weight models on GCP to stop incurring charges",
+    "should_trigger": true,
+    "rationale": "Complete infrastructure cleanup handled by /fulcrum delete --all."
+  },
+  {
+    "query": "Find an Apache 2.0 licensed open weight model with reasoning capabilities under 14B parameters",
+    "should_trigger": true,
+    "rationale": "Model search with task, license, and parameter constraints handled by /fulcrum find."
+  },
+  {
+    "query": "Generate a Terraform script to deploy DeepSeek R1 Distill 14B on GCP Compute Engine",
+    "should_trigger": true,
+    "rationale": "Infrastructure-as-code generation for open-weight serving handled by /fulcrum run."
+  },
+  {
+    "query": "How do I call the Claude 3.5 Sonnet API using Anthropic Python SDK?",
+    "should_trigger": false,
+    "rationale": "Proprietary closed-source API query, unrelated to self-hosting downloadable open-weight models."
+  },
+  {
+    "query": "Can you give me an API key and python snippet to call Google Gemini 1.5 Pro?",
+    "should_trigger": false,
+    "rationale": "Proprietary managed API access query; fulcrum focuses strictly on downloadable self-deployable open weights."
+  },
+  {
+    "query": "How do I prompt OpenAI GPT-4o for structured JSON extraction?",
+    "should_trigger": false,
+    "rationale": "Proprietary model API prompt engineering query."
+  },
+  {
+    "query": "Deploy a PostgreSQL database on Google Cloud SQL",
+    "should_trigger": false,
+    "rationale": "Generic GCP infrastructure query unrelated to open-weight LLM inference."
+  },
+  {
+    "query": "Fine-tune a LoRA adapter using Hugging Face PEFT on local PyTorch",
+    "should_trigger": false,
+    "rationale": "Training and fine-tuning query; fulcrum focuses strictly on discovery, GCP deployment, monitoring, and inference tuning."
+  },
+  {
+    "query": "Write a React frontend for a chatbot application",
+    "should_trigger": false,
+    "rationale": "Frontend web development task outside the scope of open-weight model serving."
+  },
+  {
+    "query": "Delete a Google Cloud Storage bucket containing media assets",
+    "should_trigger": false,
+    "rationale": "Generic GCP storage deletion unrelated to open-weight LLM instances."
+  },
+  {
+    "query": "Check CPU utilisation on an Amazon EKS cluster running microservices",
+    "should_trigger": false,
+    "rationale": "AWS container infrastructure query unrelated to GCP open-weight model serving."
+  },
+  {
+    "query": "Set up a CI/CD pipeline in GitHub Actions for a Go backend",
+    "should_trigger": false,
+    "rationale": "General DevOps CI/CD pipeline query."
+  }
+]
