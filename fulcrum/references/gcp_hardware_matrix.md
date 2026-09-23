@@ -122,14 +122,19 @@ Before attempting any deployment, **always verify your project's regional GPU or
 
 ### Automated Quota Verification via fulcrum
 
-`/fulcrum run` automatically audits quota before provisioning. You can also run the pre-flight checker standalone:
+`/fulcrum run` automatically audits quota before provisioning. When deploying Cloud TPUs without an explicit `--region`, Fulcrum proactively sweeps all known TPU regions (`europe-west4`, `us-central1`, `asia-southeast1`, `us-east4`), ranks them by available headroom, and automatically routes the deployment to the region with verified capacity.
+
+You can also run pre-flight audits standalone:
 
 ```bash
+# Proactively sweep all candidate TPU regions for Cloud TPU v6e (Trillium)
+.venv/bin/python3 fulcrum/scripts/check_quota.py --is-tpu --tpu-type v6e --count 8 --sweep
+
 # Verify NVIDIA L4 GPU quota on Vertex AI
 .venv/bin/python3 fulcrum/scripts/check_quota.py --platform vertex --accelerator nvidia-l4 --count 1 --region us-central1
 
-# Verify Cloud TPU v6e chip quota on Vertex AI
-.venv/bin/python3 fulcrum/scripts/check_quota.py --platform vertex --accelerator v6e --count 4 --region us-central1 --is-tpu
+# Verify Cloud TPU v6e chip quota in a specific region
+.venv/bin/python3 fulcrum/scripts/check_quota.py --platform vertex --accelerator v6e --count 4 --region europe-west4 --is-tpu
 
 # Verify NVIDIA A100 GPU quota on Compute Engine (GCE)
 .venv/bin/python3 fulcrum/scripts/check_quota.py --platform gce --accelerator nvidia-tesla-a100 --count 1 --region us-central1
@@ -147,25 +152,25 @@ gcloud compute regions describe us-central1 --project=YOUR_PROJECT_ID --format="
 ```
 
 #### 2. Vertex AI Custom Model Serving Quotas
-Vertex AI maintains dedicated quota metrics under `aiplatform.googleapis.com`:
-* **NVIDIA L4**: `CustomModelServingNvidiaL4GPUsPerProjectPerRegion`
-* **NVIDIA A100 (40GB/80GB)**: `CustomModelServingNvidiaA100GPUsPerProjectPerRegion`
-* **NVIDIA H100**: `CustomModelServingNvidiaH100GPUsPerProjectPerRegion`
-* **Cloud TPU v5e**: `Custom model serving TPU v5e chips per region`
-* **Cloud TPU v6e (Trillium)**: `Custom model serving TPU v6e chips per region`
-* **Cloud TPU v5p**: `Custom model serving TPU v5p chips per region`
+Vertex AI maintains dedicated quota metrics under `aiplatform.googleapis.com` queried via Cloud Quotas:
+* **NVIDIA L4**: `CustomModelServingNvidiaL4GPUsPerProjectPerRegion` (`custom_model_serving_nvidia_l4_gpus`)
+* **NVIDIA A100 (40GB/80GB)**: `CustomModelServingNvidiaA100GPUsPerProjectPerRegion` (`custom_model_serving_nvidia_a100_gpus`)
+* **NVIDIA H100**: `CustomModelServingNvidiaH100GPUsPerProjectPerRegion` (`custom_model_serving_nvidia_h100_gpus`)
+* **Cloud TPU v6e (Trillium)**: `CustomModelServingV6ETPUPerProjectPerRegion` (`custom_model_serving_tpu_v6e`)
+* **Cloud TPU v5e**: `CustomModelServingV5ETPUPerProjectPerRegion` (`custom_model_serving_tpu_v5e`)
+* **Cloud TPU v5p**: `CustomModelServingV5pTPUPerProjectPerRegion` (`custom_model_serving_tpu_v5p`)
 
 ### Quota Metric Reference Table
 
-| Accelerator | Hardware | GCE Metric | Vertex AI Prediction Metric | Console Filter |
+| Accelerator | Hardware | GCE Metric | Vertex AI Prediction Metric / Quota ID | Console Filter |
 | :--- | :--- | :--- | :--- | :--- |
 | **NVIDIA L4** | 24 GiB VRAM | `NVIDIA_L4_GPUS` | `custom_model_serving_nvidia_l4_gpus` | `NVIDIA_L4` |
 | **NVIDIA A100 (40GB)** | 40 GiB VRAM | `NVIDIA_A100_GPUS` | `custom_model_serving_nvidia_a100_gpus` | `NVIDIA_A100` |
 | **NVIDIA A100 (80GB)** | 80 GiB VRAM | `NVIDIA_A100_80GB_GPUS` | `custom_model_serving_nvidia_a100_gpus` | `NVIDIA_A100` |
 | **NVIDIA H100 (80GB)** | 80 GiB VRAM | `NVIDIA_H100_GPUS` | `custom_model_serving_nvidia_h100_gpus` | `NVIDIA_H100` |
-| **Cloud TPU v5e** | 16 GiB HBM / chip | `TPU_V5_LITE_PODSLICE_CHIPS` | `custom_model_serving_tpu_v5e_chips` | `TPU v5` |
-| **Cloud TPU v6e** | 32 GiB HBM / chip | `TPU_V6E_CHIPS` | `custom_model_serving_tpu_v6e_chips` | `TPU v6e` |
-| **Cloud TPU v5p** | 95 GiB HBM / chip | `TPU_V5P_CHIPS` | `custom_model_serving_tpu_v5p_chips` | `TPU v5p` |
+| **Cloud TPU v6e** | 32 GiB HBM / chip | `TPU_V6E_CHIPS` | `custom_model_serving_tpu_v6e` (`CustomModelServingV6ETPUPerProjectPerRegion`) | `custom_model_serving_tpu_v6e` |
+| **Cloud TPU v5e** | 16 GiB HBM / chip | `TPU_V5_LITE_PODSLICE_CHIPS` | `custom_model_serving_tpu_v5e` (`CustomModelServingV5ETPUPerProjectPerRegion`) | `custom_model_serving_tpu_v5e` |
+| **Cloud TPU v5p** | 95 GiB HBM / chip | `TPU_V5P_CHIPS` | `custom_model_serving_tpu_v5p` (`CustomModelServingV5pTPUPerProjectPerRegion`) | `custom_model_serving_tpu_v5p` |
 
 ### How to Request a Quota Increase
 
@@ -178,12 +183,12 @@ Vertex AI maintains dedicated quota metrics under `aiplatform.googleapis.com`:
 
 ## Deployment Best Practices
 
-1. **Verify Quotas Proactively**:
-   Always execute pre-flight quota checks or pass `--strict-quota` to `/fulcrum run` to prevent aborted deployments.
+1. **Verify Quotas Proactively & Rely on Automated Sweeping**:
+   Always execute pre-flight quota checks or pass `--strict-quota` to `/fulcrum run` to prevent aborted deployments. For Cloud TPU, Fulcrum automatically sweeps candidate regions (`europe-west4`, `us-central1`, `asia-southeast1`, `us-east4`) and routes to the region with verified capacity.
 2. **Preferred Accelerator Regions**:
-   - `us-central1` (Iowa): Highest global allocation across L4, A100, H100, and TPU v5e/v6e.
-   - `europe-west4` (Eemshaven): Primary European accelerator hub for both GPUs and TPUs.
-   - `us-east4` (Virginia) & `us-west1` (Oregon): Strong secondary GPU pools.
+   - `us-central1` (Iowa): Highest global allocation across L4, A100, H100, and TPU v5e.
+   - `europe-west4` (Eemshaven): Primary European accelerator hub; major pool for TPU v6e (Trillium) and v5e.
+   - `asia-southeast1` (Singapore) & `us-east4` (Virginia): Strong secondary TPU/GPU hubs.
 3. **Shared Memory (`--shm-size`)**:
    - GPU deployments: `--container-shared-memory-size-mb=16384` (16GB).
    - TPU deployments: `--container-shared-memory-size-mb=32768` (32GB).

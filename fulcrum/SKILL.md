@@ -104,17 +104,18 @@ Use `/fulcrum run` to provision and launch a downloadable open-weight model on G
    - Determine the active GCP project by running `gcloud config get-value project`. If a project is configured, use it automatically.
    - **Only ask the user if there is no project set** (e.g. `(unset)` or blank).
    - If deploying gated models (e.g. Meta Llama or Google Gemma), supply `HF_TOKEN` so the container can download weights from Hugging Face.
-2. **Proactive Pre-Flight Quota Verification**:
+2. **Proactive Pre-Flight Quota Verification & Regional Sweeping**:
    - `/fulcrum run` automatically audits GPU/TPU quota headroom prior to provisioning.
+   - **Automated Regional Quota Sweeping for Cloud TPUs**: When deploying on Cloud TPUs without an explicit `--region`, Fulcrum does not assume `us-central1`. It automatically queries `aiplatform.googleapis.com` across all known TPU regions (`europe-west4`, `us-central1`, `asia-southeast1`, `us-east4`), ranks them by available headroom, and dynamically routes provisioning to the region with verified capacity (e.g. routing to `europe-west4` when `us-central1` has zero quota).
    - You can also run the quota auditor standalone:
      ```bash
-     # Verify GPU quota
-     .venv/bin/python3 fulcrum/scripts/check_quota.py --platform vertex --accelerator nvidia-l4 --count 1 --region us-central1
+     # Proactively sweep candidate regions for Cloud TPU quota
+     .venv/bin/python3 fulcrum/scripts/check_quota.py --is-tpu --tpu-type v6e --count 8 --sweep
 
-     # Verify Cloud TPU quota
-     .venv/bin/python3 fulcrum/scripts/check_quota.py --platform vertex --accelerator v6e --count 4 --region us-central1 --is-tpu
+     # Verify GPU quota in specific region
+     .venv/bin/python3 fulcrum/scripts/check_quota.py --platform vertex --accelerator nvidia-l4 --count 1 --region us-central1
      ```
-   - If quota is insufficient, `/fulcrum run` highlights available headroom, suggests alternative regions (`us-central1`, `europe-west4`), and provides the direct GCP Console URL to request quota increases. Pass `--strict-quota` to abort immediately on missing quota.
+   - If quota is insufficient across all audited regions, `/fulcrum run` highlights available headroom and provides the direct GCP Console URL to request quota increases. Pass `--strict-quota` to abort immediately on missing quota.
 3. **Generate Deployment Plan (Dry-Run)**:
    By default, `/fulcrum run` automatically targets Vertex AI Endpoints:
 3. **Direct Provisioning & Execution**:

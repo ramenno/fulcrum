@@ -227,7 +227,7 @@ assert is_tpu_machine('g2-standard-48') is False
     run(f'.venv/bin/python3 -c "{code_resolve}"')
 
     # 12. Test Cloud TPU Vertex deployment specification
-    p_tpu = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-14B-Instruct --tpu-type v6e --tpu-chips 4 --format json")
+    p_tpu = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-14B-Instruct --tpu-type v6e --tpu-chips 4 --no-check-quota --format json")
     data_tpu = json.loads(p_tpu.stdout)
     assert data_tpu["machine_type"] == "ct6e-standard-4t"
     assert data_tpu["accelerator"] == "4x Cloud TPU V6E chips"
@@ -243,13 +243,13 @@ assert is_tpu_machine('g2-standard-48') is False
     assert "--accelerator " not in tpu_deploy
 
     # 13. Test Cloud TPU weight staging via GCS
-    p_tpu_gcs = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-14B-Instruct --tpu-type v6e --tpu-chips 4 --gcs-model-path gs://test-bucket/models/qwen --format json")
+    p_tpu_gcs = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-14B-Instruct --tpu-type v6e --tpu-chips 4 --no-check-quota --gcs-model-path gs://test-bucket/models/qwen --format json")
     data_tpu_gcs = json.loads(p_tpu_gcs.stdout)
     assert "GCS_MODEL_PATH=gs://test-bucket/models/qwen" in data_tpu_gcs["commands"]["upload_model"]
     assert "--model=/tmp/model" in data_tpu_gcs["commands"]["upload_model"]
 
     # 14. Test Cloud TPU Terraform generation
-    p_tpu_tf = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-14B-Instruct --tpu-type v6e --tpu-chips 4 --format terraform")
+    p_tpu_tf = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-14B-Instruct --tpu-type v6e --tpu-chips 4 --no-check-quota --format terraform")
     assert 'machine_type      = "ct6e-standard-4t"' in p_tpu_tf.stdout
     assert "accelerator_type" not in p_tpu_tf.stdout
     assert "accelerator_count" not in p_tpu_tf.stdout
@@ -715,7 +715,14 @@ def test_check_quota() -> None:
     print("Testing check_quota.py...")
     run(".venv/bin/python3 fulcrum/scripts/check_quota.py --help")
 
-    from fulcrum.scripts.check_quota import check_accelerator_quota, format_quota_report
+    from fulcrum.scripts.check_quota import (
+        check_accelerator_quota,
+        format_quota_report,
+        format_tpu_sweep_report,
+        sweep_tpu_quota,
+        QUOTA_METRIC_MAP,
+        normalize_accelerator_key,
+    )
 
     # 1. Test GPU sufficient quota
     mock_gpu_good = [{"metric": "NVIDIA_L4_GPUS", "limit": 8.0, "usage": 2.0}]
@@ -755,7 +762,46 @@ def test_check_quota() -> None:
     assert rep5["status"] == "UNVERIFIED"
     assert rep5["available"] is None
 
-    # 6. Verify launch_gcp integrates quota check
+    # 6. Test explicit TPU generations in QUOTA_METRIC_MAP
+    assert "custom_model_serving_tpu_v6e" in QUOTA_METRIC_MAP
+    assert "custom_model_serving_tpu_v5e" in QUOTA_METRIC_MAP
+    assert "custom_model_serving_tpu_v5p" in QUOTA_METRIC_MAP
+    assert QUOTA_METRIC_MAP["custom_model_serving_tpu_v6e"]["vertex_metric"] == "custom_model_serving_tpu_v6e"
+    assert QUOTA_METRIC_MAP["custom_model_serving_tpu_v5e"]["vertex_metric"] == "custom_model_serving_tpu_v5e"
+    assert QUOTA_METRIC_MAP["custom_model_serving_tpu_v5p"]["vertex_metric"] == "custom_model_serving_tpu_v5p"
+    assert normalize_accelerator_key("custom_model_serving_tpu_v6e") == "v6e"
+    assert normalize_accelerator_key("custom_model_serving_tpu_v5e") == "v5e"
+    assert normalize_accelerator_key("custom_model_serving_tpu_v5p") == "v5p"
+
+    # 7. Test automated regional quota sweeping (reproducing user incident: us-central1=0, europe-west4=8)
+    incident_mock = {
+        "us-central1": 0.0,
+        "europe-west4": 8.0,
+        "asia-southeast1": 0.0,
+        "us-east4": 0.0,
+    }
+    sweep_rep = sweep_tpu_quota("test-proj", tpu_gen="v6e", required_chips=8, mock_regional_quotas=incident_mock)
+    assert sweep_rep["status"] == "SUFFICIENT"
+    assert sweep_rep["selected_region"] == "europe-west4"
+    assert sweep_rep["regional_headroom"]["europe-west4"] == 8.0
+    assert sweep_rep["regional_headroom"]["us-central1"] == 0.0
+    fmt_sweep = format_tpu_sweep_report(sweep_rep)
+    assert "Proactive Multi-Region Cloud TPU Quota Discovery: SUFFICIENT" in fmt_sweep
+    assert "europe-west4" in fmt_sweep
+    assert "<-- Selected for Deployment" in fmt_sweep
+
+    # 8. Test sweeping when all regions have 0 quota
+    zero_mock = {
+        "us-central1": 0.0,
+        "europe-west4": 0.0,
+        "asia-southeast1": 0.0,
+        "us-east4": 0.0,
+    }
+    sweep_zero = sweep_tpu_quota("test-proj", tpu_gen="v6e", required_chips=4, mock_regional_quotas=zero_mock)
+    assert sweep_zero["status"] == "INSUFFICIENT"
+    assert "All audited TPU regions" in sweep_zero["message"]
+
+    # 9. Verify launch_gcp integrates quota check
     p_check = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model google/gemma-3-12b-it --format json")
     data_check = json.loads(p_check.stdout)
     assert "quota_check" in data_check
@@ -763,6 +809,11 @@ def test_check_quota() -> None:
     p_no_check = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model google/gemma-3-12b-it --no-check-quota --format json")
     data_no_check = json.loads(p_no_check.stdout)
     assert data_no_check["quota_check"] is None
+
+    # 10. Verify launch_gcp honors explicit --region on TPU
+    p_tpu_reg = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-14B-Instruct --tpu-type v6e --tpu-chips 4 --region europe-west4 --format json")
+    data_tpu_reg = json.loads(p_tpu_reg.stdout)
+    assert data_tpu_reg["region"] == "europe-west4"
 
     print("check_quota.py: PASSED")
 

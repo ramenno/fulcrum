@@ -264,6 +264,21 @@ Deprovisions cloud resources, deletes Vertex endpoints, tears down GCE VMs, and 
 .venv/bin/python3 fulcrum/scripts/delete_deployment.py --all --execute
 ```
 
+### 8. `/fulcrum quota` — Pre-Flight Accelerator Quota Auditor
+
+Audits available quota headroom across Vertex AI and Compute Engine, with automated regional sweeping:
+
+```bash
+# Proactively sweep all candidate TPU regions for Cloud TPU v6e (Trillium)
+.venv/bin/python3 fulcrum/scripts/check_quota.py --is-tpu --tpu-type v6e --count 8 --sweep
+
+# Verify regional NVIDIA L4 quota on Vertex AI
+.venv/bin/python3 fulcrum/scripts/check_quota.py --platform vertex --accelerator nvidia-l4 --count 1 --region us-central1
+
+# Audit Cloud TPU quota for a specific region
+.venv/bin/python3 fulcrum/scripts/check_quota.py --platform vertex --accelerator v6e --count 4 --region europe-west4 --is-tpu
+```
+
 ---
 
 ## Architectural Rules & Hardware Invariants
@@ -295,7 +310,15 @@ Cloud TPUs operate under a different serving paradigm than GPUs:
 - **HBM Utilisation**: Set `--gpu-memory-utilization=0.85` to preserve HBM headroom for XLA compilation buffers.
 - **Regional GCS Weight Staging**: Stage weights in a regional Cloud Storage bucket (`GCS_MODEL_PATH`) co-located with the endpoint region to avoid Hugging Face rate limits and container download timeouts.
 
-### 4. Layer 3 CUDA Graph Guardrail
+### 4. Proactive Multi-Region TPU Quota Sweeping
+Cloud TPU allocations differ significantly across GCP regions. For example, a project may have ample GPU quota in `us-central1`, but zero quota for `custom_model_serving_tpu_v6e` in `us-central1` while holding an active 8-chip allocation in `europe-west4`.
+When `--tpu-type` or `--accelerator tpu` is specified without an explicit `--region`:
+- Fulcrum automatically queries `aiplatform.googleapis.com` via Cloud Quotas across all known candidate TPU regions (`europe-west4`, `us-central1`, `asia-southeast1`, `us-east4`).
+- It ranks candidate regions by available headroom.
+- It dynamically routes provisioning to the region with verified capacity (e.g. automatically targeting `europe-west4`).
+- Explicit regional parameters (`--region <region>`) are strictly honoured.
+
+### 5. Layer 3 CUDA Graph Guardrail
 On large models (≥20B parameters) served on constrained VRAM (≤2x L4), vLLM's Ahead-of-Time CUDA graph memory capture allocates ~5–6 GiB per GPU, risking an immediate `OutOfMemoryError`. Fulcrum automatically enables `--enforce-eager` and injects `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reclaim VRAM.
 
 ---

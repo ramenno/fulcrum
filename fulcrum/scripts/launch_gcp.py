@@ -840,7 +840,8 @@ Examples:
 
     # Determine GCP project and region (auto-detects from gcloud, asks user only if unset)
     project = resolve_gcp_project(args.project)
-    region = args.region or args.zone.rsplit("-", 1)[0] if "-" in args.zone else "us-central1"
+    has_explicit_region = bool(args.region) or (args.zone != "us-central1-a" and "-" in args.zone)
+    region = args.region or (args.zone.rsplit("-", 1)[0] if "-" in args.zone else "us-central1")
 
     # Evaluate whether TPU deployment is requested or implied by machine type
     is_tpu = bool(
@@ -849,6 +850,7 @@ Examples:
         or (args.gpu_type and "tpu" in args.gpu_type.lower())
     )
 
+    tpu_sweep_report = None
     if is_tpu:
         tpu_gen = args.tpu_type or (
             "v6e" if "ct6e" in (args.machine_type or "")
@@ -861,6 +863,31 @@ Examples:
         gpu_type = f"tpu-{tpu_gen}"
         gpu_count = tpu_chips
         tensor_parallel = args.tensor_parallel_size or tpu_chips
+
+        # Proactive Multi-Region Cloud TPU Quota Discovery:
+        # When --accelerator tpu is specified without an explicit --region, do not assume us-central1.
+        # Query aiplatform.googleapis.com across known TPU regions, rank by available headroom,
+        # and automatically route to the region with verified capacity.
+        if not has_explicit_region and getattr(args, "check_quota", True) and check_quota:
+            tpu_sweep_report = check_quota.sweep_tpu_quota(
+                project=project,
+                tpu_gen=tpu_gen,
+                required_chips=gpu_count,
+            )
+            discovered_region = tpu_sweep_report.get("selected_region")
+            if discovered_region and tpu_sweep_report.get("status") == "SUFFICIENT":
+                if discovered_region != region:
+                    print(
+                        f"\nℹ️  [TPU QUOTA DISCOVERY]: No explicit --region provided. Discovered verified capacity in "
+                        f"'{discovered_region}' ({tpu_sweep_report['regional_headroom'].get(discovered_region, 0):.0f} chips available "
+                        f"for {tpu_sweep_report['accelerator']}). Routing deployment from '{region}' to '{discovered_region}'.\n",
+                        file=sys.stderr,
+                    )
+                    region = discovered_region
+                    args.zone = f"{region}-a"
+            elif discovered_region and discovered_region != region:
+                region = discovered_region
+                args.zone = f"{region}-a"
     else:
         # Infer GPU requirements if not explicitly supplied
         inferred_gpu, inferred_count = estimate_gpu_needs(args.model)
@@ -884,15 +911,33 @@ Examples:
     # Pre-flight quota inspection across Vertex AI and GCE
     quota_report = None
     if getattr(args, "check_quota", True) and check_quota:
-        target_accel = tpu_gen if is_tpu else gpu_type
-        quota_report = check_quota.check_accelerator_quota(
-            project=project,
-            region=region,
-            platform=platform,
-            accelerator=target_accel,
-            required_count=gpu_count,
-            is_tpu=is_tpu,
-        )
+        if is_tpu and tpu_sweep_report and not has_explicit_region:
+            quota_report = {
+                "status": tpu_sweep_report["status"],
+                "platform": platform,
+                "accelerator": tpu_sweep_report["accelerator"],
+                "region": region,
+                "project": project,
+                "required": gpu_count,
+                "metric": tpu_sweep_report["metric"],
+                "limit": tpu_sweep_report["regional_headroom"].get(region),
+                "usage": 0.0,
+                "available": tpu_sweep_report["regional_headroom"].get(region),
+                "console_url": tpu_sweep_report["console_url"],
+                "alternative_regions": [r for r in tpu_sweep_report["candidate_regions"] if r != region],
+                "message": tpu_sweep_report["message"],
+                "tpu_sweep": tpu_sweep_report,
+            }
+        else:
+            target_accel = tpu_gen if is_tpu else gpu_type
+            quota_report = check_quota.check_accelerator_quota(
+                project=project,
+                region=region,
+                platform=platform,
+                accelerator=target_accel,
+                required_count=gpu_count,
+                is_tpu=is_tpu,
+            )
         if getattr(args, "strict_quota", False) and quota_report["status"] != "SUFFICIENT":
             print(f"\n❌ [STRICT QUOTA FAILURE]: Quota for {quota_report['accelerator']} in {region} is {quota_report['status']}.", file=sys.stderr)
             print(quota_report["message"], file=sys.stderr)
