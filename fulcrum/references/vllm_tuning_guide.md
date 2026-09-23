@@ -123,6 +123,24 @@ For models with extreme context windows (e.g. Kimi K3 with 200k+ tokens or DeepS
   On Cloud TPUs, KV caching is managed entirely within High Bandwidth Memory (HBM) via Pallas PagedAttention. There is no host CPU RAM swapping mechanism. Never pass `--swap-space` when configuring or deploying on Cloud TPUs.
 - **Fixed Machine Topologies (Do Not Pass `--accelerator`)**: Cloud TPU machine types (`ct5lp-*`, `ct6e-*`, `ct5p-*`) have hardwired chip configurations. Supplying `--accelerator=type=...,count=...` triggers an immediate Vertex AI deployment failure (`INVALID_ARGUMENT: Accelerator type must not be specified for TPU machines`).
 
+### 7. Pre-Flight KV-Cache & HBM Memory Budget Calculation
+- **The Issue Encountered**:
+  When deploying large models (e.g. 32B parameters) on 4-chip TPU slices (`ct6e-standard-4t`, 124.96 GiB HBM) with requested sequence length `8192`, vLLM container warm-up crashes during initialization:
+  ```text
+  ValueError: To serve at least one request with the model's max seq len (8192), 
+  74.77 GiB KV cache is needed, which is larger than the available KV cache memory (54.58 GiB). 
+  Based on the available memory, the estimated maximum model length is 5952.
+  ```
+- **Technical Analysis**:
+  After loading ~54–63 GiB of model weights and reserving runtime buffers (~3.88 GiB for XLA/PJRT), only ~45–55 GiB of available KV cache headroom remains. On Cloud TPU with Pallas PagedAttention, block tables and memory allocations scale across the TPU chip mesh with batch buffer reservation (~37.38x stream factor). At default `max_position_embeddings=8192`, serving even a single request exceeds available HBM.
+- **Pre-Flight Memory Budget Sizing**:
+  Before submitting the deployment, Fulcrum computes:
+  $$\text{KV Memory Per Token} = 2 \times \text{layers} \times \text{kv\_heads} \times \text{head\_dim} \times \text{bytes\_per\_elem}$$
+  $$\text{Max Safe Context} = \left\lfloor \frac{\text{Total HBM} \times \text{utilization} - \text{Weight Memory} - \text{Runtime Overhead}}{\text{KV Memory Per Token} \times \text{Stream Factor}} \right\rfloor$$
+- **Automatic Dynamic Clamping**:
+  If the model's requested sequence length exceeds $\text{Max Safe Context}$, Fulcrum automatically clamps `--max-model-len` to the highest safe standard power-of-2 context (e.g. 4096) and sets `--gpu-memory-utilization 0.90` dynamically, preventing hours of failed container warmup cycles.
+
+
 
 
 

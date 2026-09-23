@@ -106,7 +106,7 @@ fulcrum/
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-org/fulcrum.git
+git clone https://github.com/ramenno/fulcrum.git
 cd fulcrum
 
 # 2. Create and activate a dedicated Python virtual environment
@@ -150,15 +150,24 @@ Calculates exact model parameter counts, weight memory footprints, and KV cache 
 
 ### 2. `/fulcrum run` — GCP Deployment Orchestrator
 
-Provisions **Vertex AI Endpoints** as the primary default running official Google Cloud vLLM container images. Automatically performs pre-flight regional quota inspection and falls back to Compute Engine or GKE when Vertex is not viable.
+Provisions **Vertex AI Endpoints** as the primary default running official Google Cloud vLLM container images, falling back to Compute Engine or GKE when Vertex is not viable.
+
+Key automated capabilities:
+- **Proactive Multi-Region Quota Sweeping**: When deploying on Cloud TPUs without an explicit `--region`, Fulcrum sweeps candidate regions (`europe-west4`, `us-central1`, `asia-southeast1`, `us-east4`), ranks headroom, and automatically routes the deployment to the region with verified capacity.
+- **Pre-Flight KV-Cache & HBM Memory Sizing**: Before deployment, Fulcrum computes available accelerator memory against requested context length:
+  $$\text{Max Safe Context} = \left\lfloor \frac{\text{Total HBM} \times \text{utilization} - \text{Weight Memory} - \text{Runtime Overhead}}{\text{Effective KV Memory Per Token}} \right\rfloor$$
+  If requested context exceeds safe capacity, Fulcrum automatically clamps `--max-model-len` (e.g. to 4096 on `ct6e-standard-4t` for 32B models) and sets `--gpu-memory-utilization 0.90` dynamically, preventing container warmup crashes.
 
 ```bash
-# Primary Default: Dry-run preview of Vertex AI Endpoint deployment for Gemma 3 12B
+# Provision on Vertex AI Endpoint directly (executes immediately)
+.venv/bin/python3 fulcrum/scripts/launch_gcp.py --model google/gemma-3-12b-it
+
+# Dry-run inspection without provisioning
 .venv/bin/python3 fulcrum/scripts/launch_gcp.py --model google/gemma-3-12b-it --dry-run
 
 # Provision on Cloud TPU v6e (4 chips) on Vertex AI
 .venv/bin/python3 fulcrum/scripts/launch_gcp.py \
-    --model Qwen/Qwen2.5-14B-Instruct \
+    --model Qwen/Qwen2.5-32B-Instruct \
     --tpu-type v6e \
     --tpu-chips 4 \
     --dry-run
@@ -182,9 +191,6 @@ Provisions **Vertex AI Endpoints** as the primary default running official Googl
 .venv/bin/python3 fulcrum/scripts/launch_gcp.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --format terraform
-
-# Directly execute provisioning on Google Cloud Platform
-.venv/bin/python3 fulcrum/scripts/launch_gcp.py --model google/gemma-3-12b-it --execute
 ```
 
 ### 3. `/fulcrum status` — Deployment Telemetry & Utilisation

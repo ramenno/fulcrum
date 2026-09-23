@@ -196,3 +196,8 @@ Vertex AI maintains dedicated quota metrics under `aiplatform.googleapis.com` qu
    When using `pytorch-vllm-serve:latest`, always explicitly specify `--container-command="python3,-m,vllm.entrypoints.openai.api_server"`, `--container-ports=8080`, `--container-predict-route="/v1/chat/completions"`, and `--container-health-route="/health"`.
 5. **CUDA Graph Memory Footprint on ≥20B Models (GPUs)**:
    Ahead-of-Time CUDA Graph workspace takes ~6.0 GiB per GPU on models ≥20B. Either provision 4x L4 (`g2-standard-48`) / 1x A100-80GB (`a2-ultragpu-1g`), or enable `--enforce-eager` to reclaim ~5–6 GiB VRAM per GPU.
+6. **Pre-Flight KV-Cache & HBM Memory Budget Sizing**:
+   Before submitting Vertex AI model deployments, static pre-flight memory sizing verifies whether available KV cache memory (after loading weights and reserving runtime buffers) can host the requested context length:
+   $$\text{Max Safe Context} = \left\lfloor \frac{\text{Total HBM} \times \text{utilization} - \text{Weight Memory} - \text{Runtime Overhead}}{\text{Effective KV Memory Per Token}} \right\rfloor$$
+   If requested context exceeds Max Safe Context, `--max-model-len` is automatically clamped (e.g. to 4096 on 4-chip slices for 32B models) and `--gpu-memory-utilization 0.90` is set dynamically to avert initialization crashes.
+

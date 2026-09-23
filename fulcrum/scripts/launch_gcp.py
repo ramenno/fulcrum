@@ -32,6 +32,11 @@ try:
 except ImportError:
     from fulcrum.scripts import check_quota
 
+try:
+    import find_model
+except ImportError:
+    from fulcrum.scripts import find_model
+
 
 # Accelerator mapping for Vertex AI
 VERTEX_ACCELERATOR_MAP = {
@@ -277,6 +282,7 @@ def generate_vertex_commands(
     is_tpu: bool = False,
     gcs_model_path: Optional[str] = None,
     container_image: Optional[str] = None,
+    gpu_memory_utilization: float = 0.90,
 ) -> Dict[str, str]:
     """Generates gcloud CLI commands for provisioning on Vertex AI Endpoints (supporting GPUs and Cloud TPUs)."""
     quant_flag = f",--quantization={quantization}" if quantization and quantization != "none" else ""
@@ -300,13 +306,12 @@ def generate_vertex_commands(
         token_env = f' \\\n    --container-env-vars="{env_vars_str}"'
 
         served_model = "/tmp/model" if gcs_model_path else model_id
-        effective_max_model_len = min(max_model_len, 4096) if max_model_len > 4096 else max_model_len
         container_args = (
             f"--model={served_model},"
             f"--port=8080,"
             f"--tensor-parallel-size={tensor_parallel},"
-            f"--max-model-len={effective_max_model_len},"
-            f"--gpu-memory-utilization=0.90,"
+            f"--max-model-len={max_model_len},"
+            f"--gpu-memory-utilization={gpu_memory_utilization:.2f},"
             f"--block-size=16,"
             f"--trust-remote-code"
             f"{quant_flag}"
@@ -332,7 +337,7 @@ def generate_vertex_commands(
             f"--port=8080,"
             f"--tensor-parallel-size={tensor_parallel},"
             f"--max-model-len={max_model_len},"
-            f"--gpu-memory-utilization=0.90"
+            f"--gpu-memory-utilization={gpu_memory_utilization:.2f}"
             f"{quant_flag}"
             f"{eager_flag}"
         )
@@ -416,6 +421,7 @@ def generate_vertex_terraform(
     is_tpu: bool = False,
     gcs_model_path: Optional[str] = None,
     container_image: Optional[str] = None,
+    gpu_memory_utilization: float = 0.90,
 ) -> str:
     """Generates Terraform HCL configuration for Vertex AI Endpoint."""
     quant_arg = f'      "--quantization={quantization}",\n' if quantization and quantization != "none" else ""
@@ -481,7 +487,7 @@ resource "google_vertex_ai_model" "model" {{
       "--model={model_id}",
       "--tensor-parallel-size={tensor_parallel}",
       "--max-model-len={max_model_len}",
-      "--gpu-memory-utilization={'0.85' if is_tpu else '0.90'}",
+      "--gpu-memory-utilization={gpu_memory_utilization:.2f}",
 {quant_arg}    ]
 {token_block}  }}
 }}
@@ -787,6 +793,12 @@ Examples:
         help="Google Cloud Storage URI where model weights are staged (e.g. gs://bucket/models/Qwen2.5-14B)",
     )
     parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=None,
+        help="Fraction of GPU/TPU memory allocated for vLLM (default: 0.90, dynamically adjusted by memory budget)",
+    )
+    parser.add_argument(
         "--spot",
         action="store_true",
         help="Deploy as a Spot instance for up to 60-70%% cost savings",
@@ -947,6 +959,32 @@ Examples:
             print(quota_report["message"], file=sys.stderr)
             sys.exit(1)
 
+    # Pre-Flight KV-Cache & HBM/VRAM Memory Budget Calculation:
+    # Sizing model weights and available accelerator memory against requested sequence length.
+    # If the model's sequence length exceeds Max Safe Context, automatically clamp --max-model-len
+    # and dynamically set --gpu-memory-utilization 0.90.
+    preflight_hw = args.machine_type or (resolve_machine_type(gpu_type, gpu_count, platform="vertex") if is_tpu else gpu_type)
+    mem_budget = None
+    if find_model:
+        mem_budget = find_model.calculate_preflight_memory_budget(
+            model_id=args.model,
+            hardware_type=preflight_hw,
+            hardware_count=gpu_count,
+            requested_max_model_len=args.max_model_len,
+            quantization=args.quantization,
+            gpu_memory_utilization=args.gpu_memory_utilization or 0.90,
+            hf_token=hf_token,
+            is_tpu=is_tpu,
+        )
+        if mem_budget.get("clamped"):
+            print(
+                f"\nℹ️  [MEMORY BUDGET PRE-FLIGHT]: {mem_budget['rationale']}\n",
+                file=sys.stderr,
+            )
+
+    effective_max_model_len = mem_budget["effective_max_model_len"] if mem_budget else args.max_model_len
+    effective_gpu_memory_utilization = mem_budget["gpu_memory_utilization"] if mem_budget else (args.gpu_memory_utilization or 0.90)
+
     # =========================================================================
     # TARGET 1: VERTEX AI ENDPOINT (PRIMARY CHOICE)
     # =========================================================================
@@ -967,13 +1005,14 @@ Examples:
             vertex_accel=vertex_accel,
             gpu_count=gpu_count,
             tensor_parallel=tensor_parallel,
-            max_model_len=args.max_model_len,
+            max_model_len=effective_max_model_len,
             quantization=args.quantization,
             hf_token=hf_token,
             enforce_eager=args.enforce_eager,
             is_tpu=is_tpu,
             gcs_model_path=args.gcs_model_path,
             container_image=args.container_image,
+            gpu_memory_utilization=effective_gpu_memory_utilization,
         )
 
         accel_desc = f"{gpu_count}x Cloud TPU {tpu_gen.upper()} chips" if is_tpu else f"{gpu_count}x {vertex_accel}"
@@ -994,6 +1033,7 @@ Examples:
             "accelerator": accel_desc,
             "vertex_accelerator": vertex_accel,
             "quantization": args.quantization,
+            "memory_budget": mem_budget,
             "spot": args.spot,
             "status": "RECORDED" if args.dry_run else "PROVISIONING",
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1010,12 +1050,13 @@ Examples:
                     vertex_accel=vertex_accel,
                     gpu_count=gpu_count,
                     tensor_parallel=tensor_parallel,
-                    max_model_len=args.max_model_len,
+                    max_model_len=effective_max_model_len,
                     quantization=args.quantization,
                     hf_token=hf_token,
                     is_tpu=is_tpu,
                     gcs_model_path=args.gcs_model_path,
                     container_image=args.container_image,
+                    gpu_memory_utilization=effective_gpu_memory_utilization,
                 )
             )
             if args.record:
@@ -1035,6 +1076,7 @@ Examples:
                 "accelerator_type": "tpu" if is_tpu else "gpu",
                 "accelerator": accel_desc,
                 "quota_check": quota_report,
+                "memory_budget": mem_budget,
                 "commands": vertex_cmds,
             }
             if args.record:
@@ -1061,6 +1103,10 @@ Examples:
         print(f"Endpoint Name:     {resource_name}")
         print(f"Serving Container: {serving_container}")
         print(f"Quantisation:      {args.quantization}")
+        if mem_budget:
+            budget_str = f"{mem_budget['effective_max_model_len']} tokens (Safe Context: {mem_budget['max_safe_context']}, Util: {mem_budget['gpu_memory_utilization']:.2f})"
+            clamp_tag = " [CLAMPED]" if mem_budget["clamped"] else " [SAFE]"
+            print(f"Memory Budget:     {budget_str}{clamp_tag}")
         if quota_report and quota_report["status"] != "SUFFICIENT":
             print("-" * 80)
             print(f"⚠️  [QUOTA NOTICE]: {quota_report['message']}")
@@ -1142,8 +1188,8 @@ Examples:
                     f"--model={served_model},"
                     f"--port=8080,"
                     f"--tensor-parallel-size={tensor_parallel},"
-                    f"--max-model-len={args.max_model_len},"
-                    f"--gpu-memory-utilization=0.85,"
+                    f"--max-model-len={effective_max_model_len},"
+                    f"--gpu-memory-utilization={effective_gpu_memory_utilization:.2f},"
                     f"--block-size=16,"
                     f"--trust-remote-code"
                     f"{quant_flag}"
@@ -1168,8 +1214,8 @@ Examples:
                     f"--model={args.model},"
                     f"--port=8080,"
                     f"--tensor-parallel-size={tensor_parallel},"
-                    f"--max-model-len={args.max_model_len},"
-                    f"--gpu-memory-utilization=0.90"
+                    f"--max-model-len={effective_max_model_len},"
+                    f"--gpu-memory-utilization={effective_gpu_memory_utilization:.2f}"
                     f"{quant_flag}"
                     f"{eager_flag}"
                 )
@@ -1266,7 +1312,7 @@ Examples:
             gpu_count=gpu_count,
             gpu_type=gpu_type,
             tensor_parallel=tensor_parallel,
-            max_model_len=args.max_model_len,
+            max_model_len=effective_max_model_len,
             port=args.port,
             hf_token=hf_token,
         )
@@ -1282,12 +1328,13 @@ Examples:
             "zone": args.zone,
             "gpu_type": gpu_type,
             "gpu_count": gpu_count,
+            "memory_budget": mem_budget,
             "status": "RECORDED",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
         if args.format == "json":
-            print(json.dumps({"platform": "gke", "manifest": gke_yaml}, indent=2))
+            print(json.dumps({"platform": "gke", "manifest": gke_yaml, "memory_budget": mem_budget}, indent=2))
             return
 
         print("\nKubernetes Manifest (apply with kubectl apply -f <manifest.yaml>):")
@@ -1307,7 +1354,7 @@ Examples:
         model=args.model,
         port=args.port,
         tensor_parallel=tensor_parallel,
-        max_model_len=args.max_model_len,
+        max_model_len=effective_max_model_len,
         quantization=args.quantization,
         hf_token=hf_token,
     )
@@ -1377,6 +1424,7 @@ Examples:
             "create_command": create_cmd,
             "startup_script": startup_script,
             "quota_check": quota_report,
+            "memory_budget": mem_budget,
         }
         print(json.dumps(data, indent=2))
         return
@@ -1399,6 +1447,10 @@ Examples:
     print(f"Instance Name:     {instance_name}")
     print(f"Service Port:      {args.port}")
     print(f"Quantisation:      {args.quantization}")
+    if mem_budget:
+        budget_str = f"{mem_budget['effective_max_model_len']} tokens (Safe Context: {mem_budget['max_safe_context']}, Util: {mem_budget['gpu_memory_utilization']:.2f})"
+        clamp_tag = " [CLAMPED]" if mem_budget["clamped"] else " [SAFE]"
+        print(f"Memory Budget:     {budget_str}{clamp_tag}")
     if quota_report and quota_report["status"] != "SUFFICIENT":
         print("-" * 80)
         print(f"⚠️  [QUOTA NOTICE]: {quota_report['message']}")
@@ -1419,6 +1471,7 @@ Examples:
         "gpu_count": gpu_count,
         "port": args.port,
         "quantization": args.quantization,
+        "memory_budget": mem_budget,
         "spot": args.spot,
         "firewall_rule": f"fulcrum-allow-vllm-{args.port}",
         "status": "RECORDED" if args.dry_run else "PROVISIONING",

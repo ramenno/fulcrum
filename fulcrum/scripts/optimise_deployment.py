@@ -64,10 +64,13 @@ def formulate_recommendations(
 
     if arch == "tpu":
         # Cloud TPU specific recommendations
-        flags["--gpu-memory-utilization"] = 0.85
+        flags["--gpu-memory-utilization"] = 0.90
         flags["--block-size"] = 16
         rationales.append(
-            "Set --gpu-memory-utilization to 0.85 to preserve HBM headroom for Ahead-of-Time (AOT) XLA execution graphs and intermediate activations."
+            "Set --gpu-memory-utilization to 0.90 dynamically to balance KV cache memory against HBM reservations for AOT XLA execution graphs and intermediate activations."
+        )
+        rationales.append(
+            "Pre-Flight KV-Cache Sizing: Verify that model weights plus KV cache at max-model-len do not exceed total available HBM (Total HBM * 0.90 - Weight Memory). On 4-chip slices (125 GiB HBM) for >=27B-32B models, clamp --max-model-len to 4096 to prevent container startup failure."
         )
         rationales.append(
             "Omit --swap-space: CPU swap space for KV cache offloading is unsupported in vLLM Cloud TPU builds (vllm.entrypoints.openai.api_server) and causes fatal argparse exit code 2. All KV blocks are managed directly in TPU HBM via Pallas PagedAttention."

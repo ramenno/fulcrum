@@ -128,6 +128,27 @@ def test_find_model() -> None:
         assert rec_gpu["count"] >= 4, ">=20B models on L4 must require at least 4 GPUs to prevent CUDA Graph OOM"
     rec_tpu = calc_qwen["recommended_tpu"]
     assert rec_tpu["chips"] >= 4, ">=30B models on TPU require at least 4 chips"
+
+    code_budget = """
+from fulcrum.scripts.find_model import calculate_preflight_memory_budget, get_hardware_memory_gib
+
+assert get_hardware_memory_gib('ct6e-standard-4t', 4) == 124.96
+assert get_hardware_memory_gib('ct6e-standard-8t', 8) == 249.92
+assert get_hardware_memory_gib('nvidia-l4', 1) == 24.0
+assert get_hardware_memory_gib('nvidia-l4', 4) == 96.0
+
+b_clamped = calculate_preflight_memory_budget('Qwen/Qwen2.5-32B-Instruct', 'ct6e-standard-4t', 4, 8192, is_tpu=True)
+assert b_clamped['clamped'] is True
+assert b_clamped['effective_max_model_len'] == 4096
+assert b_clamped['gpu_memory_utilization'] == 0.90
+assert b_clamped['max_safe_context'] < 8192
+
+b_safe = calculate_preflight_memory_budget('Qwen/Qwen2.5-32B-Instruct', 'ct6e-standard-8t', 8, 8192, is_tpu=True)
+assert b_safe['clamped'] is False
+assert b_safe['effective_max_model_len'] == 8192
+assert b_safe['max_safe_context'] > 8192
+"""
+    run(f'.venv/bin/python3 -c "{code_budget}"')
     print("find_model.py: PASSED")
 
 
@@ -255,6 +276,23 @@ assert is_tpu_machine('g2-standard-48') is False
     assert "accelerator_count" not in p_tpu_tf.stdout
     assert 'image_uri     = "vllm/vllm-tpu:latest"' in p_tpu_tf.stdout
 
+    # 15. Test pre-flight KV-cache memory budget calculation and automatic clamping
+    p_clamped = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-32B-Instruct --tpu-type v6e --tpu-chips 4 --max-model-len 8192 --no-check-quota --format json")
+    data_clamped = json.loads(p_clamped.stdout)
+    assert "memory_budget" in data_clamped
+    assert data_clamped["memory_budget"]["clamped"] is True
+    assert data_clamped["memory_budget"]["effective_max_model_len"] == 4096
+    assert data_clamped["memory_budget"]["gpu_memory_utilization"] == 0.90
+    assert "--max-model-len=4096" in data_clamped["commands"]["upload_model"]
+    assert "--gpu-memory-utilization=0.90" in data_clamped["commands"]["upload_model"]
+
+    # 16. Test that 8-chip slice does not clamp 8192 context
+    p_8t = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-32B-Instruct --tpu-type v6e --tpu-chips 8 --max-model-len 8192 --no-check-quota --format json")
+    data_8t = json.loads(p_8t.stdout)
+    assert data_8t["memory_budget"]["clamped"] is False
+    assert data_8t["memory_budget"]["effective_max_model_len"] == 8192
+    assert "--max-model-len=8192" in data_8t["commands"]["upload_model"]
+
     if os.path.exists(test_db):
         os.remove(test_db)
     print("launch_gcp.py: PASSED")
@@ -345,10 +383,11 @@ def test_optimise_deployment() -> None:
     # Test Cloud TPU tuning advice
     p_tpu_opt = run(".venv/bin/python3 fulcrum/scripts/optimise_deployment.py advise --model Qwen/Qwen2.5-14B-Instruct --gpu-type ct6e-standard-4t --gpu-count 4 --format json")
     data_tpu_opt = json.loads(p_tpu_opt.stdout)
-    assert data_tpu_opt["flags"]["--gpu-memory-utilization"] == 0.85
+    assert data_tpu_opt["flags"]["--gpu-memory-utilization"] == 0.90
     assert "--swap-space" not in data_tpu_opt["flags"]
     assert data_tpu_opt["flags"]["--block-size"] == 16
     assert any("Omit --swap-space" in r for r in data_tpu_opt["rationales"])
+    assert any("Pre-Flight KV-Cache Sizing" in r for r in data_tpu_opt["rationales"])
     assert any("Pallas" in r for r in data_tpu_opt["rationales"])
     assert any("Static Sequence Length Bucketing" in r for r in data_tpu_opt["rationales"])
     assert any("Do NOT pass --accelerator" in r for r in data_tpu_opt["rationales"])
