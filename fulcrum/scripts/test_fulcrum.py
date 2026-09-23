@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import time
+import unittest.mock as mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -294,7 +295,12 @@ assert is_tpu_machine('g2-standard-48') is False
     assert "--max-model-len=8192" in data_8t["commands"]["upload_model"]
 
     # 17. Test extract_operation_id_from_output helper
-    from fulcrum.scripts.launch_gcp import extract_operation_id_from_output, poll_vertex_operation
+    from fulcrum.scripts.launch_gcp import (
+        extract_operation_id_from_output,
+        poll_vertex_operation,
+        classify_vertex_error,
+        VertexTransientCapacityError,
+    )
     s1 = "Operation [projects/123/locations/europe-west4/operations/1810106235958067200] has not finished in 1800 seconds"
     assert extract_operation_id_from_output(s1) == "1810106235958067200"
     s2 = '{"name": "projects/my-proj/locations/us-central1/operations/998877665544332211"}'
@@ -304,7 +310,28 @@ assert is_tpu_machine('g2-standard-48') is False
     assert extract_operation_id_from_output("") is None
     assert extract_operation_id_from_output(None) is None
 
-    # 18. Test poll_vertex_operation with mock responses
+    # 18. Test classify_vertex_error differentiation
+    c14 = classify_vertex_error(14, 'Machine type temporarily unavailable, please deploy with a different machine type or retry. Machine type: "ct6e-standard-4t"')
+    assert c14["is_transient"] is True
+    assert c14["quota_intact"] is True
+    assert c14["category"] == "TRANSIENT_CAPACITY_STOCKOUT"
+    assert "Code 14 UNAVAILABLE" in c14["title"]
+
+    c14_msg = classify_vertex_error(None, "machine type temporarily unavailable")
+    assert c14_msg["is_transient"] is True
+    assert c14_msg["category"] == "TRANSIENT_CAPACITY_STOCKOUT"
+
+    c8 = classify_vertex_error(8, "Resource exhausted: Quota exceeded for custom_model_serving_tpu_v6e")
+    assert c8["is_transient"] is False
+    assert c8["quota_intact"] is False
+    assert c8["category"] == "QUOTA_EXHAUSTED"
+
+    c3 = classify_vertex_error(3, "Invalid argument: accelerator_type is not supported on this machine type")
+    assert c3["is_transient"] is False
+    assert c3["quota_intact"] is True
+    assert c3["category"] == "INVALID_CONFIGURATION"
+
+    # 19. Test poll_vertex_operation with mock responses
     import unittest.mock as mock
 
     # Mock successful completion
@@ -316,7 +343,7 @@ assert is_tpu_machine('g2-standard-48') is False
         res = poll_vertex_operation("1810106235958067200", "test-proj", "europe-west4", timeout_seconds=10, interval_seconds=1, max_poll_iterations=1)
         assert res.get("done") is True
 
-    # Mock failure error
+    # Mock failure error (Quota Code 8)
     mock_fail = mock.MagicMock()
     mock_fail.returncode = 0
     mock_fail.stdout = json.dumps({"done": True, "error": {"code": 8, "message": "Resource exhausted"}})
@@ -328,12 +355,38 @@ assert is_tpu_machine('g2-standard-48') is False
         except RuntimeError as e:
             assert "Resource exhausted" in str(e)
 
-    # 19. Test async deploy command generated in launch_gcp dry-run
+    # Mock transient capacity stock-out error (Code 14)
+    mock_stockout = mock.MagicMock()
+    mock_stockout.returncode = 0
+    mock_stockout.stdout = json.dumps({
+        "done": True,
+        "error": {
+            "code": 14,
+            "message": 'Machine type temporarily unavailable, please deploy with a different machine type or retry. Machine type: "ct6e-standard-4t"',
+        },
+    })
+
+    with mock.patch("subprocess.run", return_value=mock_stockout):
+        try:
+            poll_vertex_operation("1810106235958067200", "test-proj", "europe-west4", timeout_seconds=10, interval_seconds=1, max_poll_iterations=1)
+            assert False, "Expected VertexTransientCapacityError on Code 14"
+        except VertexTransientCapacityError as e:
+            assert e.code == 14
+            assert "temporarily unavailable" in str(e)
+            assert "ct6e-standard-4t" in str(e)
+
+    # 20. Test async deploy command generated in launch_gcp dry-run
     p_async_cmd = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model google/gemma-3-12b-it --format json")
     data_async = json.loads(p_async_cmd.stdout)
     deploy_cmd = data_async["commands"]["deploy_model"]
     assert "Option B: Asynchronous REST API dispatch" in deploy_cmd
     assert "gcloud ai operations describe" in deploy_cmd
+
+    # 21. Test CLI flags --retry-transient, --max-retries, --retry-delay
+    p_help = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --help")
+    assert "--retry-transient" in p_help.stdout
+    assert "--max-retries" in p_help.stdout
+    assert "--retry-delay" in p_help.stdout
 
     if os.path.exists(test_db):
         os.remove(test_db)
@@ -348,7 +401,24 @@ def test_status_deployment() -> None:
 
     run(".venv/bin/python3 fulcrum/scripts/status_deployment.py --help")
 
-    # Populate test database with both Vertex and GCE deployments
+    # Test query_vertex_operation with Code 14 mock
+    from fulcrum.scripts.status_deployment import query_vertex_operation
+    mock_stockout_op = mock.MagicMock()
+    mock_stockout_op.returncode = 0
+    mock_stockout_op.stdout = json.dumps({
+        "done": True,
+        "error": {
+            "code": 14,
+            "message": 'Machine type temporarily unavailable, please deploy with a different machine type or retry. Machine type: "ct6e-standard-4t"',
+        },
+    })
+    with mock.patch("subprocess.run", return_value=mock_stockout_op):
+        st, done, err_txt = query_vertex_operation("1810106235958067200", "europe-west4", "test-proj")
+        assert st == "STOCKOUT"
+        assert done is True
+        assert "temporarily unavailable" in err_txt
+
+    # Populate test database with Vertex, GCE, and STOCKOUT deployments
     dummy_deployments = [
         {
             "id": "fulcrum-gemma-3-12b-it",
@@ -378,6 +448,21 @@ def test_status_deployment() -> None:
             "status": "RECORDED",
             "created_at": "2026-09-09T00:00:00Z",
         },
+        {
+            "id": "fulcrum-stockout-tpu",
+            "endpoint_name": "fulcrum-stockout-tpu",
+            "platform": "vertex",
+            "model": "Qwen/Qwen2.5-32B-Instruct",
+            "project": "test-proj",
+            "region": "europe-west4",
+            "machine_type": "ct6e-standard-4t",
+            "accelerator": "4x Cloud TPU V6E chips",
+            "gpu_count": 4,
+            "operation_id": "1810106235958067200",
+            "operation_error": 'code: 14: Machine type temporarily unavailable, please deploy with a different machine type or retry. Machine type: "ct6e-standard-4t"',
+            "status": "STOCKOUT",
+            "created_at": "2026-09-09T00:00:00Z",
+        },
     ]
     with open(test_db, "w") as f:
         json.dump(dummy_deployments, f)
@@ -388,19 +473,28 @@ def test_status_deployment() -> None:
     assert "GCE" in p_table.stdout
     assert "fulcrum-gemma-3-12b-it" in p_table.stdout
     assert "fulcrum-llama-3-1-8b" in p_table.stdout
+    assert "STOCKOUT" in p_table.stdout
 
     # Test JSON output
     p_json = run(".venv/bin/python3 fulcrum/scripts/status_deployment.py --format json", env_vars={"FULCRUM_DB_PATH": test_db})
     data = json.loads(p_json.stdout)
-    assert len(data) == 2
+    assert len(data) == 3
     assert data[0]["platform"] == "vertex"
     assert data[0]["operation_id"] == "1810106235958067200"
     assert data[1]["platform"] == "gce"
+    assert data[2]["status"] == "STOCKOUT"
 
     # Test verbose diagnostics for Vertex (including Operation ID display)
     p_verb = run(".venv/bin/python3 fulcrum/scripts/status_deployment.py --id fulcrum-gemma-3-12b-it --verbose", env_vars={"FULCRUM_DB_PATH": test_db})
     assert "Vertex Predict URI" in p_verb.stdout
     assert "1810106235958067200" in p_verb.stdout
+
+    # Test verbose diagnostics for STOCKOUT
+    p_verb_so = run(".venv/bin/python3 fulcrum/scripts/status_deployment.py --id fulcrum-stockout-tpu --verbose", env_vars={"FULCRUM_DB_PATH": test_db})
+    assert "Transient datacentre capacity stock-out" in p_verb_so.stdout
+    assert "Quota is INTACT" in p_verb_so.stdout
+    assert "europe-west4" in p_verb_so.stdout
+    assert "Suggested Action" in p_verb_so.stdout
 
     if os.path.exists(test_db):
         os.remove(test_db)

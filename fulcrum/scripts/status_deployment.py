@@ -86,7 +86,11 @@ def query_vertex_operation(operation_id: str, region: str, project: str) -> Tupl
             if is_done:
                 err = data.get("error")
                 if err:
-                    return "FAILED", True, err.get("message")
+                    err_code = err.get("code")
+                    err_msg = err.get("message", "Unknown error")
+                    if err_code == 14 or "temporarily unavailable" in str(err_msg).lower() or "code: 14" in str(err_msg).lower():
+                        return "STOCKOUT", True, err_msg
+                    return "FAILED", True, err_msg
                 return "SUCCEEDED", True, None
             meta = data.get("metadata", {})
             state = meta.get("genericMetadata", {}).get("state", "RUNNING")
@@ -205,8 +209,8 @@ def inspect_deployment(deployment: Dict[str, Any]) -> Dict[str, Any]:
             op_state, op_done, op_err = query_vertex_operation(operation_id, region, project)
             if not op_done and op_state in ("RUNNING", "PENDING"):
                 vertex_state = "PROVISIONING"
-            elif op_done and op_state == "FAILED":
-                vertex_state = "FAILED"
+            elif op_done and op_state in ("STOCKOUT", "FAILED"):
+                vertex_state = op_state
 
         live_status = vertex_state if vertex_state != "UNKNOWN" else deployment.get("status", "RECORDED")
         updates: Dict[str, Any] = {}
@@ -343,7 +347,18 @@ def print_verbose_details(inspections: List[Dict[str, Any]]) -> None:
             if item.get("operation_state"):
                 print(f"  Operation State:   {item.get('operation_state')}")
             if item.get("operation_error"):
-                print(f"  Operation Error:   {item.get('operation_error')}")
+                op_err = str(item.get("operation_error", ""))
+                print(f"  Operation Error:   {op_err}")
+                if item.get("live_status") == "STOCKOUT" or item.get("status") == "STOCKOUT" or "code: 14" in op_err.lower() or "temporarily unavailable" in op_err.lower():
+                    print(f"  Diagnosis:         Transient datacentre capacity stock-out (Code 14 UNAVAILABLE).")
+                    print(f"                     ✓ Quota is INTACT; machine type configuration is VALID.")
+                    print(f"                     ℹ️ Physical accelerator nodes are temporarily in contention in {reg}.")
+                    print(f"  Suggested Action:  Retry deployment in 5–15 minutes, or route to an alternate region.")
+            elif item.get("live_status") == "STOCKOUT" or item.get("status") == "STOCKOUT":
+                print(f"  Diagnosis:         Transient datacentre capacity stock-out (Code 14 UNAVAILABLE).")
+                print(f"                     ✓ Quota is INTACT; machine type configuration is VALID.")
+                print(f"                     ℹ️ Physical accelerator nodes are temporarily in contention in {reg}.")
+                print(f"  Suggested Action:  Retry deployment in 5–15 minutes, or route to an alternate region.")
             print(f"  Vertex Predict URI: {uri}")
             print(f"  Curl Test (IAM OAuth2):")
             print(f"    curl -X POST \\")

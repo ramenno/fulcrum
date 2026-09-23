@@ -176,7 +176,28 @@ For models with extreme context windows (e.g. Kimi K3 with 200k+ tokens or DeepS
   ```
   Fulcrum monitors the deployment with real-time stage updates up to 7,200 seconds (2 hours). If standard `gcloud` CLI was used and hit the 1,800s timeout, Fulcrum automatically intercepts the Operation ID from `stderr` and hands off to the operation poller without failing the workflow.
 
-
-
-
+### 9. Handling Transient Datacentre Allocation Stock-Outs (Code 14 UNAVAILABLE)
+- **The Issue Encountered**:
+  During model deployment on high-demand accelerator topologies (such as Cloud TPU `ct6e-standard-4t` or NVIDIA H100/A100 instances), the deployment operation may fail during node allocation with:
+  ```text
+  code: 14: Machine type temporarily unavailable, please deploy with a different machine type or retry. Machine type: "ct6e-standard-4t"
+  ```
+- **Root Cause & Technical Analysis**:
+  - **Differentiating Quota vs Physical Capacity**:
+    - **Code 14 (`UNAVAILABLE`)**: This is **NOT** a quota exhaustion (Code 8 `RESOURCE_EXHAUSTED`) or an invalid configuration (Code 3 `INVALID_ARGUMENT`). Project quota is completely **intact**, and the machine type specification is completely **valid**.
+    - Code 14 represents transient physical node contention in the datacentre. Physical TPU or GPU host racks in that specific zone are temporarily occupied by other multi-tenant training, fine-tuning, or inference jobs.
+    - Cloud datacentre node contention is ephemeral: as other batch workloads conclude, nodes are released back into the unallocated pool (often within 5 to 15 minutes).
+- **Automated Diagnosis & Actionable Guidance**:
+  Fulcrum explicitly intercepts Code 14 across async operation polling and CLI fallback:
+  - Reassures the operator that quota is intact and configuration is valid.
+  - Updates the deployment status to `STOCKOUT` in the local state database.
+  - Recommends immediate operational remedies: wait 5–15 minutes and retry, or route to an alternate region with verified capacity.
+- **Automated Exponential Backoff Retry**:
+  Fulcrum provides native automated retry capabilities via `--retry-transient`:
+  ```bash
+  python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen2.5-14B-Instruct \
+      --tpu-type v6e --tpu-chips 4 --region europe-west4 \
+      --retry-transient --max-retries 2 --retry-delay 300
+  ```
+  When `--retry-transient` is enabled, Fulcrum catches Code 14, logs an explanation banner, and executes exponential backoff retries (`delay = retry_delay * (1.5 ** attempt)`). As demonstrated in production sessions, retrying 15 minutes later succeeded immediately once nodes became free.
 

@@ -202,5 +202,10 @@ Vertex AI maintains dedicated quota metrics under `aiplatform.googleapis.com` qu
    If requested context exceeds Max Safe Context, `--max-model-len` is automatically clamped (e.g. to 4096 on 4-chip slices for 32B models) and `--gpu-memory-utilization 0.90` is set dynamically to avert initialization crashes.
 7. **Decouple Deployments from the 30-Minute Client Socket Timeout**:
    Large models (27B+) on Cloud TPU or multi-GPU instances routinely require 35–45 minutes for container pull, 50+ GiB weight streaming, and Ahead-Of-Time (AOT) JAX/XLA graph compilation. Synchronous `gcloud ai endpoints deploy-model` aborts at 1,800s (30m) with a client socket timeout and does not support `--async`. Always dispatch deployments asynchronously via the Vertex AI REST API (`POST ...:deployModel`), record the Operation ID, and hand off monitoring to an internal progress poller (`gcloud ai operations describe`) with real-time stage updates up to 7,200s (2 hours).
+8. **Handling Transient Datacentre Capacity Stock-Outs (Code 14 UNAVAILABLE)**:
+   Physical TPU and GPU host nodes in high-demand datacentres can experience transient stock-outs during peak utilisation:
+   `code: 14: Machine type temporarily unavailable, please deploy with a different machine type or retry. Machine type: "ct6e-standard-4t"`.
+   Code 14 is physical node contention, **not** quota exhaustion (Code 8 `RESOURCE_EXHAUSTED`) or invalid configuration (Code 3 `INVALID_ARGUMENT`). Project quota is completely intact. Transient contention typically clears within 5–15 minutes as existing workloads complete. Use `--retry-transient` to automate exponential backoff retries, or route to an alternate region with available quota headroom.
+
 
 

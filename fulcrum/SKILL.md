@@ -125,8 +125,12 @@ Use `/fulcrum run` to provision and launch a downloadable open-weight model on G
    - Large models (27B–70B+) on Cloud TPU or multi-GPU topologies require image pulling, streaming 50+ GiB of weights, and Ahead-Of-Time (AOT) JAX/XLA graph compilation, routinely taking 35–45 minutes.
    - Synchronous `gcloud ai endpoints deploy-model` terminates at 1,800 seconds (30 minutes) with a client socket timeout and rejects `--async`.
    - `/fulcrum run` natively dispatches deployments asynchronously via the Vertex AI REST API (`POST ...:deployModel`), capturing the Operation ID in <1 second and delegating monitoring to an internal progress poller (`gcloud ai operations describe`) with real-time stage updates up to 7,200s (2 hours).
-   - If standard `gcloud` CLI hits the 1,800s timeout, Fulcrum automatically intercepts the active Operation ID from stderr and seamlessly hands off to the operation poller without aborting.
-5. **Direct Provisioning & Execution**:
+    - If standard `gcloud` CLI hits the 1,800s timeout, Fulcrum automatically intercepts the active Operation ID from stderr and seamlessly hands off to the operation poller without aborting.
+5. **Handling Transient Datacentre Allocation Stock-Outs (Code 14 UNAVAILABLE)**:
+   - High-demand accelerators (Cloud TPU `ct6e-standard-4t`, NVIDIA H100s) can encounter temporary node contention: `code: 14: Machine type temporarily unavailable`.
+   - Fulcrum explicitly classifies Code 14 as physical node contention, assuring the operator that project quota is intact and configuration is valid.
+   - Use `--retry-transient` (with configurable `--max-retries` and `--retry-delay`) to automatically execute exponential backoff retries (e.g. 5–15 minutes), or route to an alternate region.
+6. **Direct Provisioning & Execution**:
    When the necessary deployment parameters are known (model identifier, platform, quantisation, and GCP project), `/fulcrum run` proceeds immediately with execution on Google Cloud Platform without requiring confirmation prompts or an `--execute` flag:
    ```bash
    # Standard GPU deployment on Vertex AI (executes immediately)
@@ -135,6 +139,9 @@ Use `/fulcrum run` to provision and launch a downloadable open-weight model on G
    # Cloud TPU deployment on Vertex AI (e.g. TPU v6e Trillium 4 chips)
    .venv/bin/python3 fulcrum/scripts/launch_gcp.py --model <huggingface-id> --tpu-type v6e --tpu-chips 4
 
+   # Cloud TPU deployment with automated retry on transient capacity stock-outs
+   .venv/bin/python3 fulcrum/scripts/launch_gcp.py --model <huggingface-id> --tpu-type v6e --tpu-chips 4 --retry-transient --max-retries 2
+
    # Cloud TPU deployment with regional GCS bucket weight staging
    .venv/bin/python3 fulcrum/scripts/launch_gcp.py --model <huggingface-id> --tpu-type v6e --tpu-chips 4 --gcs-model-path gs://my-bucket/models/qwen
 
@@ -142,7 +149,7 @@ Use `/fulcrum run` to provision and launch a downloadable open-weight model on G
    .venv/bin/python3 fulcrum/scripts/launch_gcp.py --model <huggingface-id> --platform gce
    ```
    Add `--record` to register the planned deployment into the local state database immediately.
-6. **Dry-Run & Infrastructure-as-Code Generation**:
+7. **Dry-Run & Infrastructure-as-Code Generation**:
    If the user specifically requests a preview of deployment commands without provisioning infrastructure, or requests Terraform/JSON definitions, pass `--dry-run` or `--format`:
    ```bash
    # Dry-run inspection without provisioning
@@ -177,7 +184,8 @@ Use `/fulcrum status` to check the status, health, and live utilisation metrics 
 
 ### Metrics Monitored:
 - **Platform**: `VERTEX` vs `GCE`.
-- **Lifecycle Status**: Vertex Endpoint state (`ACTIVE`, `NO_MODELS`) or GCE VM status (`RUNNING`, `TERMINATED`).
+- **Lifecycle Status**: Vertex Endpoint state (`ACTIVE`, `NO_MODELS`, `PROVISIONING`, `STOCKOUT`, `FAILED`) or GCE VM status (`RUNNING`, `TERMINATED`).
+- **Diagnosis**: High-visibility diagnostic banners for transient datacentre stock-outs (`Code 14 UNAVAILABLE`) with actionable suggestions.
 - **Health**: Service health probe against `/health`.
 - **KV Cache & Concurrency**: Scraped from vLLM Prometheus metrics for GCE instances.
 

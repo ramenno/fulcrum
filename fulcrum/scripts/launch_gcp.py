@@ -269,6 +269,102 @@ def evaluate_platform_viability(
     )
 
 
+class VertexTransientCapacityError(RuntimeError):
+    """Raised when Vertex AI model deployment encounters a Code 14 (UNAVAILABLE) datacentre capacity stock-out."""
+    def __init__(
+        self,
+        message: str,
+        operation_id: Optional[str] = None,
+        code: int = 14,
+        raw_error: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.operation_id = operation_id
+        self.code = code
+        self.raw_error = raw_error or {}
+
+
+def classify_vertex_error(code: Any, message: str) -> Dict[str, Any]:
+    """
+    Classifies Google Cloud Vertex AI deployment errors to distinguish transient physical
+    datacentre stock-outs from quota exhaustion and configuration errors.
+    """
+    code_int = None
+    try:
+        code_int = int(code)
+    except (ValueError, TypeError):
+        pass
+
+    msg_lower = (message or "").lower()
+
+    if (
+        code_int == 14
+        or "code: 14" in msg_lower
+        or "code 14" in msg_lower
+        or "temporarily unavailable" in msg_lower
+        or "machine type temporarily unavailable" in msg_lower
+    ):
+        return {
+            "code": 14,
+            "category": "TRANSIENT_CAPACITY_STOCKOUT",
+            "name": "UNAVAILABLE",
+            "is_transient": True,
+            "quota_intact": True,
+            "title": "Datacentre Capacity Stock-Out (Code 14 UNAVAILABLE)",
+            "explanation": (
+                "Transient physical node contention in the datacentre. Your project quota is INTACT "
+                "and the machine type configuration is VALID. Hardware accelerators in the specified "
+                "region/zone are temporarily occupied by other workloads."
+            ),
+            "remedy": (
+                "Retry after a short interval (5–15 minutes) or route to another region with available "
+                "capacity headroom."
+            ),
+        }
+    elif code_int == 8 or "resource exhausted" in msg_lower or "quota exceeded" in msg_lower:
+        return {
+            "code": 8,
+            "category": "QUOTA_EXHAUSTED",
+            "name": "RESOURCE_EXHAUSTED",
+            "is_transient": False,
+            "quota_intact": False,
+            "title": "Project Quota Exhausted (Code 8 RESOURCE_EXHAUSTED)",
+            "explanation": (
+                "Project quota limit has been reached for this accelerator or machine type in the target region."
+            ),
+            "remedy": (
+                "Request a quota increase in the Google Cloud Console or select a region with unused quota headroom."
+            ),
+        }
+    elif code_int == 3 or "invalid argument" in msg_lower:
+        return {
+            "code": 3,
+            "category": "INVALID_CONFIGURATION",
+            "name": "INVALID_ARGUMENT",
+            "is_transient": False,
+            "quota_intact": True,
+            "title": "Invalid Configuration or Arguments (Code 3 INVALID_ARGUMENT)",
+            "explanation": (
+                "The requested machine specification, accelerator parameter, or container argument is invalid."
+            ),
+            "remedy": (
+                "Verify machine type, accelerator type, and container parameters (e.g. ensure --accelerator is not passed for TPU)."
+            ),
+        }
+    else:
+        return {
+            "code": code_int or "UNKNOWN",
+            "category": "UNKNOWN_ERROR",
+            "name": f"ERROR_{code}",
+            "is_transient": False,
+            "quota_intact": None,
+            "title": f"Google Cloud Deployment Error (Code {code})",
+            "explanation": message or "An unspecified error occurred during deployment.",
+            "remedy": "Check Cloud Logging and Vertex AI operation details for further diagnostics.",
+        }
+
+
 def extract_operation_id_from_output(text: str) -> Optional[str]:
     """
     Extracts Vertex AI Operation ID or full operation resource name from command output.
@@ -426,8 +522,17 @@ def poll_vertex_operation(
                 if err:
                     err_msg = err.get("message", "Unknown Google Cloud error")
                     err_code = err.get("code", "UNKNOWN")
+                    classification = classify_vertex_error(err_code, err_msg)
+                    if classification["is_transient"]:
+                        raise VertexTransientCapacityError(
+                            f"Vertex AI deployment operation {op_num} encountered transient datacentre stock-out "
+                            f"[Code {err_code} {classification['name']}]: {err_msg}",
+                            operation_id=op_num,
+                            code=14,
+                            raw_error=err,
+                        )
                     raise RuntimeError(
-                        f"Vertex AI deployment operation {op_num} FAILED [Code {err_code}]: {err_msg}"
+                        f"Vertex AI deployment operation {op_num} FAILED [Code {err_code} {classification['name']}]: {err_msg}"
                     )
                 logger_func(f"✅ [DEPLOYMENT COMPLETE]: Operation {op_num} finished successfully in {time_str}!")
                 return op_data
@@ -1046,6 +1151,23 @@ Examples:
         action="store_true",
         help="Strictly abort deployment if quota check fails or is unverified",
     )
+    parser.add_argument(
+        "--retry-transient",
+        action="store_true",
+        help="Automatically retry deployment with exponential backoff on transient datacentre capacity stock-outs (Code 14 UNAVAILABLE)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        help="Maximum retry attempts on transient capacity stock-outs (default: 2 when --retry-transient is set, else 0)",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=int,
+        default=300,
+        help="Initial retry backoff delay in seconds (default: 300s / 5 minutes)",
+    )
 
     args = parser.parse_args()
 
@@ -1462,93 +1584,207 @@ Examples:
                 print(f"Uploaded Model ID: {model_id}")
             record_data["vertex_model_id"] = model_id
 
-            print("Step 3: Deploying model to endpoint (Asynchronous Dispatch)...")
-            # 1. Attempt asynchronous REST API dispatch to decouple from gcloud's 1,800s client socket timeout
-            op_name, op_id = dispatch_vertex_deploy_model_async(
-                project=project,
-                region=region,
-                endpoint_id=ep_id,
-                model_id=model_id,
-                display_name=f"{resource_name}-deployed",
-                machine_type=machine_type,
-                vertex_accel=vertex_accel,
-                gpu_count=gpu_count,
-                is_tpu=is_tpu,
+            # Step 3: Deploying model to endpoint with transient stock-out retry handling
+            max_retries = (
+                args.max_retries
+                if args.max_retries is not None
+                else (2 if getattr(args, "retry_transient", False) else 0)
             )
+            retry_delay = getattr(args, "retry_delay", 300)
 
+            attempt = 0
             res3_code = 1
-            if op_id:
-                record_data["operation_id"] = op_id
-                record_data["status"] = "DEPLOYING"
-                db.add_deployment(record_data)
-                try:
-                    poll_vertex_operation(
-                        operation_id=op_id,
-                        project=project,
-                        region=region,
-                        timeout_seconds=timeout_sec,
-                    )
-                    res3_code = 0
-                except Exception as e:
-                    print(f"\nDeployment error during operation polling: {e}", file=sys.stderr)
-                    res3_code = 1
-            else:
-                # 2. Resilient CLI fallback: invoke gcloud and intercept any 1,800s client timeout
-                print("Notice: Dispatching via gcloud CLI with automatic 1,800s timeout interception...")
-                accel_param = "" if is_tpu else f"--accelerator=type={gpu_type.lower()},count={gpu_count} "
-                deploy_cmd = (
-                    f"gcloud ai endpoints deploy-model {ep_id} "
-                    f"--project={project} "
-                    f"--region={region} "
-                    f"--model={model_id} "
-                    f"--display-name={resource_name}-deployed "
-                    f"--machine-type={machine_type} "
-                    f"{accel_param}"
-                    f"--min-replica-count=1 "
-                    f"--max-replica-count=1 "
-                    f"--traffic-split=0=100"
-                )
-                res3 = subprocess.run(deploy_cmd, shell=True, capture_output=True, text=True, check=False)
-                combined_output = f"{res3.stdout}\n{res3.stderr}"
-                if res3.stdout:
-                    print(res3.stdout)
+            last_error: Optional[Exception] = None
+            last_classification: Optional[Dict[str, Any]] = None
 
-                if res3.returncode == 0:
-                    res3_code = 0
-                else:
-                    # Check if gcloud exited due to the 1,800s client timeout:
-                    # "Operation [projects/.../operations/<id>] has not finished in 1800 seconds"
-                    recovered_op_id = extract_operation_id_from_output(combined_output)
-                    if recovered_op_id:
-                        print(f"\nℹ️  [TIMEOUT RECOVERY]: Intercepted active Vertex Operation ID {recovered_op_id} from gcloud client timeout.")
-                        print(f"   Decoupling from client socket timeout and handing off to operation poller...")
-                        record_data["operation_id"] = recovered_op_id
-                        record_data["status"] = "DEPLOYING"
-                        db.add_deployment(record_data)
-                        try:
-                            poll_vertex_operation(
-                                operation_id=recovered_op_id,
-                                project=project,
-                                region=region,
-                                timeout_seconds=timeout_sec,
+            while attempt <= max_retries:
+                if attempt > 0:
+                    current_delay = int(retry_delay * (1.5 ** (attempt - 1)))
+                    print(
+                        f"\n⏳ [TRANSIENT RETRY]: Attempt {attempt}/{max_retries} scheduled. "
+                        f"Waiting {current_delay // 60}m {current_delay % 60:02d}s before re-dispatching..."
+                    )
+                    time.sleep(current_delay)
+
+                attempt_str = f" (Attempt {attempt + 1}/{max_retries + 1})" if max_retries > 0 else ""
+                print(f"Step 3: Deploying model to endpoint (Asynchronous Dispatch{attempt_str})...")
+
+                # 1. Attempt asynchronous REST API dispatch to decouple from gcloud's 1,800s client socket timeout
+                op_name, op_id = dispatch_vertex_deploy_model_async(
+                    project=project,
+                    region=region,
+                    endpoint_id=ep_id,
+                    model_id=model_id,
+                    display_name=f"{resource_name}-deployed",
+                    machine_type=machine_type,
+                    vertex_accel=vertex_accel,
+                    gpu_count=gpu_count,
+                    is_tpu=is_tpu,
+                )
+
+                if op_id:
+                    record_data["operation_id"] = op_id
+                    record_data["status"] = "DEPLOYING"
+                    db.add_deployment(record_data)
+                    try:
+                        poll_vertex_operation(
+                            operation_id=op_id,
+                            project=project,
+                            region=region,
+                            timeout_seconds=timeout_sec,
+                        )
+                        res3_code = 0
+                        break
+                    except VertexTransientCapacityError as e:
+                        last_error = e
+                        last_classification = classify_vertex_error(14, str(e))
+                        print(
+                            f"\n⚠️  [TRANSIENT CAPACITY STOCK-OUT DETECTED (Code 14 UNAVAILABLE)]:\n"
+                            f"   Datacentre capacity stock-out: Physical node contention for '{machine_type}'.\n"
+                            f"   ✓ Your project quota is INTACT.\n"
+                            f"   ✓ The machine type configuration is VALID.\n"
+                            f"   ℹ️  Other tenants or workloads are currently occupying physical nodes in {region}.",
+                            file=sys.stderr,
+                        )
+                        if attempt < max_retries:
+                            print(
+                                f"   ℹ️  Retrying deployment in accordance with transient retry policy...",
+                                file=sys.stderr,
                             )
-                            res3_code = 0
-                        except Exception as e:
-                            print(f"\nDeployment error during operation polling: {e}", file=sys.stderr)
+                            attempt += 1
+                            continue
+                        else:
                             res3_code = 1
+                            break
+                    except Exception as e:
+                        last_error = e
+                        last_classification = classify_vertex_error("UNKNOWN", str(e))
+                        print(f"\nDeployment error during operation polling: {e}", file=sys.stderr)
+                        res3_code = 1
+                        break
+                else:
+                    # 2. Resilient CLI fallback: invoke gcloud and intercept any 1,800s client timeout
+                    print("Notice: Dispatching via gcloud CLI with automatic 1,800s timeout interception...")
+                    accel_param = "" if is_tpu else f"--accelerator=type={gpu_type.lower()},count={gpu_count} "
+                    deploy_cmd = (
+                        f"gcloud ai endpoints deploy-model {ep_id} "
+                        f"--project={project} "
+                        f"--region={region} "
+                        f"--model={model_id} "
+                        f"--display-name={resource_name}-deployed "
+                        f"--machine-type={machine_type} "
+                        f"{accel_param}"
+                        f"--min-replica-count=1 "
+                        f"--max-replica-count=1 "
+                        f"--traffic-split=0=100"
+                    )
+                    res3 = subprocess.run(deploy_cmd, shell=True, capture_output=True, text=True, check=False)
+                    combined_output = f"{res3.stdout}\n{res3.stderr}"
+                    if res3.stdout:
+                        print(res3.stdout)
+
+                    if res3.returncode == 0:
+                        res3_code = 0
+                        break
                     else:
-                        if res3.stderr:
-                            print(res3.stderr, file=sys.stderr)
-                        res3_code = res3.returncode
+                        recovered_op_id = extract_operation_id_from_output(combined_output)
+                        if recovered_op_id:
+                            print(f"\nℹ️  [TIMEOUT RECOVERY]: Intercepted active Vertex Operation ID {recovered_op_id} from gcloud client timeout.")
+                            print(f"   Decoupling from client socket timeout and handing off to operation poller...")
+                            record_data["operation_id"] = recovered_op_id
+                            record_data["status"] = "DEPLOYING"
+                            db.add_deployment(record_data)
+                            try:
+                                poll_vertex_operation(
+                                    operation_id=recovered_op_id,
+                                    project=project,
+                                    region=region,
+                                    timeout_seconds=timeout_sec,
+                                )
+                                res3_code = 0
+                                break
+                            except VertexTransientCapacityError as e:
+                                last_error = e
+                                last_classification = classify_vertex_error(14, str(e))
+                                print(
+                                    f"\n⚠️  [TRANSIENT CAPACITY STOCK-OUT DETECTED (Code 14 UNAVAILABLE)]:\n"
+                                    f"   Datacentre capacity stock-out: Physical node contention for '{machine_type}'.\n"
+                                    f"   ✓ Your project quota is INTACT.\n"
+                                    f"   ✓ The machine type configuration is VALID.\n"
+                                    f"   ℹ️  Other tenants or workloads are currently occupying physical nodes in {region}.",
+                                    file=sys.stderr,
+                                )
+                                if attempt < max_retries:
+                                    print(f"   ℹ️  Retrying deployment in accordance with transient retry policy...", file=sys.stderr)
+                                    attempt += 1
+                                    continue
+                                else:
+                                    res3_code = 1
+                                    break
+                            except Exception as e:
+                                last_error = e
+                                last_classification = classify_vertex_error("UNKNOWN", str(e))
+                                print(f"\nDeployment error during operation polling: {e}", file=sys.stderr)
+                                res3_code = 1
+                                break
+                        else:
+                            cli_classification = classify_vertex_error(
+                                14 if "code: 14" in combined_output or "temporarily unavailable" in combined_output.lower() else "CLI_ERR",
+                                combined_output,
+                            )
+                            if cli_classification["is_transient"]:
+                                last_error = RuntimeError(combined_output)
+                                last_classification = cli_classification
+                                print(
+                                    f"\n⚠️  [TRANSIENT CAPACITY STOCK-OUT DETECTED (Code 14 UNAVAILABLE)]:\n"
+                                    f"   Datacentre capacity stock-out: Physical node contention for '{machine_type}'.\n"
+                                    f"   ✓ Your project quota is INTACT.\n"
+                                    f"   ✓ The machine type configuration is VALID.\n"
+                                    f"   ℹ️  Other tenants or workloads are currently occupying physical nodes in {region}.",
+                                    file=sys.stderr,
+                                )
+                                if attempt < max_retries:
+                                    print(f"   ℹ️  Retrying deployment in accordance with transient retry policy...", file=sys.stderr)
+                                    attempt += 1
+                                    continue
+                                else:
+                                    res3_code = 1
+                                    break
+                            else:
+                                if res3.stderr:
+                                    print(res3.stderr, file=sys.stderr)
+                                res3_code = res3.returncode
+                                last_classification = cli_classification
+                                break
 
             if res1_code == 0 and res2_code == 0 and res3_code == 0:
                 record_data["status"] = "RUNNING"
                 db.add_deployment(record_data)
                 print(f"\nSuccessfully deployed {resource_name} to Vertex AI Endpoint!")
             else:
-                record_data["status"] = "FAILED"
-                db.add_deployment(record_data)
-                print(f"\nVertex deployment encountered errors. Check quotas and permissions.", file=sys.stderr)
+                if last_classification and last_classification.get("is_transient"):
+                    record_data["status"] = "STOCKOUT"
+                    record_data["error_code"] = 14
+                    record_data["error_category"] = "TRANSIENT_CAPACITY_STOCKOUT"
+                    record_data["error_message"] = str(last_error) if last_error else "Transient datacentre stock-out (Code 14)"
+                    db.add_deployment(record_data)
+                    print(
+                        f"\n❌ [DEPLOYMENT ABORTED]: Datacentre capacity stock-out (Code 14 UNAVAILABLE).\n"
+                        f"   Hardware accelerator nodes for '{machine_type}' in '{region}' are temporarily unavailable.\n"
+                        f"   ✓ Quota: INTACT (no quota exhaustion)\n"
+                        f"   ✓ Configuration: VALID\n"
+                        f"   Suggested actions:\n"
+                        f"   1. Re-run deployment in 5–15 minutes (or pass --retry-transient to automate backoff retries).\n"
+                        f"   2. Route to an alternative region with verified quota using --region (e.g. europe-west4, us-central1).",
+                        file=sys.stderr,
+                    )
+                else:
+                    record_data["status"] = "FAILED"
+                    if last_classification:
+                        record_data["error_code"] = last_classification.get("code")
+                        record_data["error_category"] = last_classification.get("category")
+                    db.add_deployment(record_data)
+                    print(f"\nVertex deployment encountered errors. Check quotas and permissions.", file=sys.stderr)
                 sys.exit(1)
         return
 

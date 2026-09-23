@@ -50,7 +50,7 @@ Fulcrum focuses **exclusively on open-weight models** whose checkpoints can be d
 
 - 🔍 **Hardware & VRAM Sizing (`/fulcrum find`)**: Calculates exact weight footprints, KV cache allocation, and activation overheads across BF16, FP8, AWQ, and INT4 precision formats. Maps footprints to NVIDIA GPUs and Cloud TPU topologies.
 - 🚀 **Vertex AI First Orchestration (`/fulcrum run`)**: Provisions **Vertex AI Endpoints** as the primary default using official Google Cloud vLLM container images. Automatically falls back to Compute Engine (or GKE) when Vertex is not viable.
-- 🛡️ **Pre-Flight Quota Auditing**: Verifies regional GPU (`NVIDIA_L4_GPUS`, `NVIDIA_A100_GPUS`) and Cloud TPU (`custom_model_serving_tpu_v5e_chips`, `custom_model_serving_tpu_v6e_chips`) quota prior to provisioning, preventing `RESOURCE_EXHAUSTED` deployment rejections.
+- 🛡️ **Pre-Flight Quota Auditing & Stock-Out Resilience**: Verifies regional GPU (`NVIDIA_L4_GPUS`, `NVIDIA_A100_GPUS`) and Cloud TPU (`custom_model_serving_tpu_v5e_chips`, `custom_model_serving_tpu_v6e_chips`) quota prior to provisioning, and gracefully handles transient datacentre node stock-outs (`Code 14 UNAVAILABLE`) with automated exponential backoff retries.
 - 📊 **Live Telemetry & State Monitoring (`/fulcrum status`)**: Scrapes vLLM Prometheus metrics (GPU/HBM KV cache utilisation %, request queue depth, active requests) and reports endpoint lifecycle state.
 - ⚡ **Benchmarking & Latency Sweeps (`/fulcrum benchmark`)**: Measures Time To First Token (TTFT), Time Per Output Token (TPOT), inter-token latency (ITL jitter), throughput, and concurrency saturation knees.
 - 💬 **Interactive Streaming Web Chat (`/fulcrum chat`)**: Single-file web interface featuring Server-Sent Events (SSE) token streaming, real-time performance telemetry heads-up display (HUD), and automatic Google Cloud IAM access token lifecycle management.
@@ -158,6 +158,7 @@ Key automated capabilities:
   $$\text{Max Safe Context} = \left\lfloor \frac{\text{Total HBM} \times \text{utilization} - \text{Weight Memory} - \text{Runtime Overhead}}{\text{Effective KV Memory Per Token}} \right\rfloor$$
   If requested context exceeds safe capacity, Fulcrum automatically clamps `--max-model-len` (e.g. to 4096 on `ct6e-standard-4t` for 32B models) and sets `--gpu-memory-utilization 0.90` dynamically, preventing container warmup crashes.
 - **Decoupled Asynchronous Dispatch & Operation Poller**: Large models (27B–70B+) on Cloud TPU or multi-GPU instances require image pulling, 50+ GiB weight streaming, and Ahead-Of-Time (AOT) JAX/XLA compilation, taking 35–45 minutes. Synchronous `gcloud ai endpoints deploy-model` terminates at 1,800s (30m) with a client socket timeout. Fulcrum natively dispatches deployments asynchronously via the Vertex AI REST API (`POST ...:deployModel`), records the Operation ID in <1 second, and hands off to an internal progress poller (`gcloud ai operations describe`) with real-time stage updates up to 7,200s (2 hours). If standard `gcloud` CLI hits the 1,800s timeout, Fulcrum intercepts the Operation ID from stderr and seamlessly recovers.
+- **Transient Capacity Stock-Out Handling (Code 14 UNAVAILABLE)**: High-demand accelerator nodes (TPU `ct6e-standard-4t`, H100s) can encounter temporary datacentre contention: `code: 14: Machine type temporarily unavailable`. Fulcrum explicitly distinguishes this from quota exhaustion (Code 8), confirms project quota is intact, marks state as `STOCKOUT`, and provides native automated exponential backoff retries (`--retry-transient`, `--max-retries`, `--retry-delay`).
 
 ```bash
 # Provision on Vertex AI Endpoint directly (executes immediately)
@@ -172,6 +173,13 @@ Key automated capabilities:
     --tpu-type v6e \
     --tpu-chips 4 \
     --dry-run
+
+# Provision on Cloud TPU v6e with automated retry on transient capacity stock-outs
+.venv/bin/python3 fulcrum/scripts/launch_gcp.py \
+    --model Qwen/Qwen2.5-32B-Instruct \
+    --tpu-type v6e \
+    --tpu-chips 4 \
+    --retry-transient
 
 # Provision on Compute Engine (GCE fallback) with Spot pricing
 .venv/bin/python3 fulcrum/scripts/launch_gcp.py \
