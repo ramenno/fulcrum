@@ -486,6 +486,8 @@ def poll_vertex_operation(
     op_num = operation_id.split("/")[-1]
     logger_func(f"🚀 [ASYNC DEPLOYMENT DISPATCHED]: Handed off monitoring to operation poller for Operation ID: {op_num}")
     logger_func(f"   Monitoring endpoint deployment (timeout: {timeout_seconds // 60}m, poll interval: {interval_seconds}s)...")
+    logger_func(f"   💡 Tip: Stream live container startup, weight streaming, and compilation logs in another terminal:")
+    logger_func(f"      .venv/bin/python3 fulcrum/scripts/status_deployment.py --logs --follow")
 
     iterations = 0
     while True:
@@ -532,6 +534,7 @@ def poll_vertex_operation(
                             raw_error=err,
                         )
                     raise RuntimeError(
+                        f"Vertex AI deployment operation {op_num} FAILED [Code {err_code}]: {err_msg}"
                         f"Vertex AI deployment operation {op_num} FAILED [Code {err_code} {classification['name']}]: {err_msg}"
                     )
                 logger_func(f"✅ [DEPLOYMENT COMPLETE]: Operation {op_num} finished successfully in {time_str}!")
@@ -1621,7 +1624,6 @@ Examples:
                     gpu_count=gpu_count,
                     is_tpu=is_tpu,
                 )
-
                 if op_id:
                     record_data["operation_id"] = op_id
                     record_data["status"] = "DEPLOYING"
@@ -1687,6 +1689,9 @@ Examples:
                         res3_code = 0
                         break
                     else:
+                        if res3.stderr:
+                            print(res3.stderr, file=sys.stderr)
+                        res3_code = res3.returncode
                         recovered_op_id = extract_operation_id_from_output(combined_output)
                         if recovered_op_id:
                             print(f"\nℹ️  [TIMEOUT RECOVERY]: Intercepted active Vertex Operation ID {recovered_op_id} from gcloud client timeout.")
@@ -1762,6 +1767,9 @@ Examples:
                 db.add_deployment(record_data)
                 print(f"\nSuccessfully deployed {resource_name} to Vertex AI Endpoint!")
             else:
+                record_data["status"] = "FAILED"
+                db.add_deployment(record_data)
+                print(f"\nVertex deployment encountered errors. Check quotas and permissions.", file=sys.stderr)
                 if last_classification and last_classification.get("is_transient"):
                     record_data["status"] = "STOCKOUT"
                     record_data["error_code"] = 14

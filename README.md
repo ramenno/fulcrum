@@ -50,6 +50,7 @@ Fulcrum focuses **exclusively on open-weight models** whose checkpoints can be d
 
 - 🔍 **Hardware & VRAM Sizing (`/fulcrum find`)**: Calculates exact weight footprints, KV cache allocation, and activation overheads across BF16, FP8, AWQ, and INT4 precision formats. Maps footprints to NVIDIA GPUs and Cloud TPU topologies.
 - 🚀 **Vertex AI First Orchestration (`/fulcrum run`)**: Provisions **Vertex AI Endpoints** as the primary default using official Google Cloud vLLM container images. Automatically falls back to Compute Engine (or GKE) when Vertex is not viable.
+- 🛡️ **Pre-Flight Quota Auditing**: Verifies regional GPU (`NVIDIA_L4_GPUS`, `NVIDIA_A100_GPUS`) and Cloud TPU (`custom_model_serving_tpu_v5e_chips`, `custom_model_serving_tpu_v6e_chips`) quota prior to provisioning, preventing `RESOURCE_EXHAUSTED` deployment rejections.
 - 🛡️ **Pre-Flight Quota Auditing & Stock-Out Resilience**: Verifies regional GPU (`NVIDIA_L4_GPUS`, `NVIDIA_A100_GPUS`) and Cloud TPU (`custom_model_serving_tpu_v5e_chips`, `custom_model_serving_tpu_v6e_chips`) quota prior to provisioning, and gracefully handles transient datacentre node stock-outs (`Code 14 UNAVAILABLE`) with automated exponential backoff retries.
 - 📊 **Live Telemetry & State Monitoring (`/fulcrum status`)**: Scrapes vLLM Prometheus metrics (GPU/HBM KV cache utilisation %, request queue depth, active requests) and reports endpoint lifecycle state.
 - ⚡ **Benchmarking & Latency Sweeps (`/fulcrum benchmark`)**: Measures Time To First Token (TTFT), Time Per Output Token (TPOT), inter-token latency (ITL jitter), throughput, and concurrency saturation knees.
@@ -203,8 +204,10 @@ Key automated capabilities:
 ```
 
 ### 3. `/fulcrum status` — Deployment Telemetry & Utilisation
+### 3. `/fulcrum status` — Deployment Telemetry, Utilisation & Cloud Logging
 
 Monitors running endpoints and VMs, tests health routes (`/health`), and scrapes live vLLM Prometheus metrics:
+Monitors running endpoints and VMs, tests health routes (`/health`), scrapes live vLLM Prometheus metrics, and streams live container logs:
 
 ```bash
 # Inspect all tracked deployments (Vertex AI and GCE)
@@ -212,6 +215,12 @@ Monitors running endpoints and VMs, tests health routes (`/health`), and scrapes
 
 # Detailed diagnostics for a specific deployment ID
 .venv/bin/python3 fulcrum/scripts/status_deployment.py --id fulcrum-gemma-3-12b-it --verbose
+
+# Stream live container startup, weight streaming, and compilation logs in real time
+.venv/bin/python3 fulcrum/scripts/status_deployment.py --id fulcrum-qwen2-5-32b --logs --follow
+
+# Inspect recent 100 log lines with semantic component formatting
+.venv/bin/python3 fulcrum/scripts/status_deployment.py --id fulcrum-qwen2-5-32b --logs --lines 100
 
 # Continuous live monitoring (poll every 5 seconds)
 .venv/bin/python3 fulcrum/scripts/status_deployment.py --watch 5

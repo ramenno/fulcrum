@@ -310,6 +310,7 @@ assert is_tpu_machine('g2-standard-48') is False
     assert extract_operation_id_from_output("") is None
     assert extract_operation_id_from_output(None) is None
 
+    # 18. Test poll_vertex_operation with mock responses
     # 18. Test classify_vertex_error differentiation
     c14 = classify_vertex_error(14, 'Machine type temporarily unavailable, please deploy with a different machine type or retry. Machine type: "ct6e-standard-4t"')
     assert c14["is_transient"] is True
@@ -343,6 +344,7 @@ assert is_tpu_machine('g2-standard-48') is False
         res = poll_vertex_operation("1810106235958067200", "test-proj", "europe-west4", timeout_seconds=10, interval_seconds=1, max_poll_iterations=1)
         assert res.get("done") is True
 
+    # Mock failure error
     # Mock failure error (Quota Code 8)
     mock_fail = mock.MagicMock()
     mock_fail.returncode = 0
@@ -355,6 +357,7 @@ assert is_tpu_machine('g2-standard-48') is False
         except RuntimeError as e:
             assert "Resource exhausted" in str(e)
 
+    # 19. Test async deploy command generated in launch_gcp dry-run
     # Mock transient capacity stock-out error (Code 14)
     mock_stockout = mock.MagicMock()
     mock_stockout.returncode = 0
@@ -401,6 +404,7 @@ def test_status_deployment() -> None:
 
     run(".venv/bin/python3 fulcrum/scripts/status_deployment.py --help")
 
+    # Populate test database with both Vertex and GCE deployments
     # Test query_vertex_operation with Code 14 mock
     from fulcrum.scripts.status_deployment import query_vertex_operation
     mock_stockout_op = mock.MagicMock()
@@ -495,6 +499,76 @@ def test_status_deployment() -> None:
     assert "Quota is INTACT" in p_verb_so.stdout
     assert "europe-west4" in p_verb_so.stdout
     assert "Suggested Action" in p_verb_so.stdout
+
+    # Test Cloud Logging log formatting and filter generation
+    from fulcrum.scripts.status_deployment import (
+        format_vllm_log_entry,
+        build_vertex_log_filter,
+        build_gce_log_filter,
+        resolve_endpoint_numeric_id,
+    )
+
+    # 1. Format classification tests
+    entry_core = {"timestamp": "2026-09-24T10:00:00Z", "severity": "INFO", "textPayload": "INFO 09-24 10:00:00 [core.py:123] Initializing an LLM engine (v0.6.2)..."}
+    res_core = format_vllm_log_entry(entry_core)
+    assert "[vLLM EngineCore]" in res_core
+    assert "Initializing an LLM engine" in res_core
+
+    entry_weights = {"timestamp": "2026-09-24T10:05:00Z", "severity": "INFO", "textPayload": "Fetching 15 safetensors checkpoint shards: 100% complete"}
+    res_weights = format_vllm_log_entry(entry_weights)
+    assert "[Weight Streaming]" in res_weights
+
+    entry_jax = {"timestamp": "2026-09-24T10:12:00Z", "severity": "INFO", "textPayload": "Compiling graph for bucket 512 using Pallas kernel on Cloud TPU v6e..."}
+    res_jax = format_vllm_log_entry(entry_jax)
+    assert "[JAX/XLA Compilation]" in res_jax
+
+    entry_api = {"timestamp": "2026-09-24T10:20:00Z", "severity": "INFO", "jsonPayload": {"message": "Route /v1/chat/completions registered and healthy on port 8080"}}
+    res_api = format_vllm_log_entry(entry_api)
+    assert "[vLLM APIServer]" in res_api
+
+    entry_err = {"timestamp": "2026-09-24T10:25:00Z", "severity": "ERROR", "textPayload": "CUDA out of memory error"}
+    res_err = format_vllm_log_entry(entry_err)
+    assert "[Error]" in res_err
+
+    # 2. Filter builder tests
+    vf = build_vertex_log_filter("1810106235958067200", min_timestamp="2026-09-24T10:00:00Z")
+    assert 'resource.type="aiplatform.googleapis.com/Endpoint"' in vf
+    assert 'resource.labels.endpoint_id="1810106235958067200"' in vf
+    assert 'timestamp > "2026-09-24T10:00:00Z"' in vf
+
+    gf = build_gce_log_filter("my-instance")
+    assert 'resource.type="gce_instance"' in gf
+
+    # 3. Numeric ID resolver tests
+    assert resolve_endpoint_numeric_id("1810106235958067200", "us-central1", "proj") == "1810106235958067200"
+
+    # 4. CLI help test for --logs and --follow
+    p_help = run(".venv/bin/python3 fulcrum/scripts/status_deployment.py --help")
+    assert "--logs" in p_help.stdout
+    assert "--follow" in p_help.stdout
+
+    # 5. In-process fetch_cloud_logs and tail_deployment_logs test
+    import io
+    from contextlib import redirect_stdout
+    from fulcrum.scripts.status_deployment import tail_deployment_logs, fetch_cloud_logs
+
+    mock_log_proc = mock.MagicMock()
+    mock_log_proc.returncode = 0
+    mock_log_proc.stdout = json.dumps([
+        {"timestamp": "2026-09-24T10:00:00Z", "severity": "INFO", "textPayload": "Initializing an LLM engine"},
+        {"timestamp": "2026-09-24T10:05:00Z", "severity": "INFO", "textPayload": "Fetching safetensors checkpoint shards"},
+    ])
+    with mock.patch("subprocess.run", return_value=mock_log_proc):
+        logs = fetch_cloud_logs('resource.type="aiplatform.googleapis.com/Endpoint"', "test-proj", 10)
+        assert len(logs) == 2
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            tail_deployment_logs(dummy_deployments[0], follow=False, lines=10, raw=False)
+        out = buf.getvalue()
+        assert "Tailing Cloud Logging for Vertex AI Endpoint" in out
+        assert "[vLLM EngineCore]" in out
+        assert "[Weight Streaming]" in out
 
     if os.path.exists(test_db):
         os.remove(test_db)

@@ -187,6 +187,214 @@ def query_vllm_metrics(ip: str, port: int) -> Dict[str, Any]:
     return res
 
 
+def resolve_endpoint_numeric_id(endpoint_ref: str, region: str, project: str) -> str:
+    """
+    Resolves the numeric Endpoint ID for Vertex AI from a display name or endpoint reference.
+    Cloud Logging requires the numeric ID for resource.labels.endpoint_id.
+    """
+    if not endpoint_ref:
+        return ""
+    if endpoint_ref.isdigit():
+        return endpoint_ref
+
+    # 1. Try gcloud ai endpoints describe
+    try:
+        proc = subprocess.run(
+            [
+                "gcloud", "ai", "endpoints", "describe", endpoint_ref,
+                f"--region={region}", f"--project={project}",
+                "--format=value(name.basename())",
+            ],
+            capture_output=True, text=True, timeout=8, check=False
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            val = proc.stdout.strip().splitlines()[-1].strip()
+            if val.isdigit():
+                return val
+    except Exception:
+        pass
+
+    # 2. Try querying by displayName
+    try:
+        proc = subprocess.run(
+            [
+                "gcloud", "ai", "endpoints", "list",
+                f"--region={region}", f"--project={project}",
+                f"--filter=displayName={endpoint_ref}",
+                "--format=value(name.basename())",
+                "--sort-by=~createTime", "--limit=1",
+            ],
+            capture_output=True, text=True, timeout=8, check=False
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            val = proc.stdout.strip().splitlines()[-1].strip()
+            if val.isdigit():
+                return val
+    except Exception:
+        pass
+
+    return endpoint_ref
+
+
+def build_vertex_log_filter(endpoint_numeric_id: str, min_timestamp: Optional[str] = None) -> str:
+    """Constructs Cloud Logging query filter for Vertex AI Endpoint container logs."""
+    filter_expr = f'resource.type="aiplatform.googleapis.com/Endpoint" AND (resource.labels.endpoint_id="{endpoint_numeric_id}" OR jsonPayload.endpointId="{endpoint_numeric_id}")'
+    if min_timestamp:
+        filter_expr += f' AND timestamp > "{min_timestamp}"'
+    return filter_expr
+
+
+def build_gce_log_filter(instance_name: str, min_timestamp: Optional[str] = None) -> str:
+    """Constructs Cloud Logging query filter for GCE instance container / syslog logs."""
+    filter_expr = f'resource.type="gce_instance" AND (logName=~"syslog" OR logName=~"vllm")'
+    if min_timestamp:
+        filter_expr += f' AND timestamp > "{min_timestamp}"'
+    return filter_expr
+
+
+def format_vllm_log_entry(entry: Dict[str, Any]) -> str:
+    """
+    Cleanses and classifies a Cloud Logging entry into a semantic vLLM component.
+    Distinguishes EngineCore, APIServer, Weight Streaming, and JAX/XLA graph compilation.
+    """
+    ts = entry.get("timestamp", "")
+    ts_short = ts[:19].replace("T", " ") if len(ts) >= 19 else ts
+    severity = str(entry.get("severity", "INFO")).upper()
+
+    text = entry.get("textPayload")
+    if not text:
+        json_payload = entry.get("jsonPayload")
+        if isinstance(json_payload, dict):
+            text = json_payload.get("message") or json_payload.get("log") or json.dumps(json_payload)
+        else:
+            text = str(entry)
+    text = str(text).strip()
+
+    lower_text = text.lower()
+
+    if any(k in lower_text for k in ["fetching", "safetensors", "downloading weights", "loading model weights", "checkpoint shards", "weight download"]):
+        cat = "Weight Streaming"
+    elif any(k in lower_text for k in ["compiling graph", "pallas kernel", "xla compilation", "jax", "pjrt", "aot compilation", "cuda graph", "capturing cuda graph"]):
+        cat = "JAX/XLA Compilation"
+    elif any(k in lower_text for k in ["api_server.py", "uvicorn", "fastapi", "route /v1", "started server process", "application startup complete"]):
+        cat = "vLLM APIServer"
+    elif any(k in lower_text for k in ["enginecore", "core.py", "model_runner.py", "initializing an llm engine", "worker.py", "tpu_executor", "ray_gpu_executor"]):
+        cat = "vLLM EngineCore"
+    elif severity in ("ERROR", "CRITICAL"):
+        cat = "Error"
+    elif severity == "WARNING":
+        cat = "Warning"
+    else:
+        cat = "Container"
+
+    # Strip redundant internal prefixes: e.g. "INFO 09-24 10:15:30 [core.py:123] " or "INFO:     "
+    cleaned = re.sub(r"^(?:INFO|WARNING|ERROR|DEBUG)\s+\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+\[?[^\]:]+:\d+\]?\s*", "", text)
+    cleaned = re.sub(r"^(?:INFO|WARNING|ERROR|DEBUG):\s+", "", cleaned)
+    if not cleaned:
+        cleaned = text
+
+    time_prefix = f"[{ts_short}] " if ts_short else ""
+    return f"{time_prefix}[{cat}] {cleaned}"
+
+
+def fetch_cloud_logs(log_filter: str, project: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Fetches log entries matching filter from Cloud Logging using gcloud logging read."""
+    cmd = [
+        "gcloud", "logging", "read",
+        log_filter,
+        f"--project={project}",
+        f"--limit={limit}",
+        "--order=asc",
+        "--format=json",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+    except Exception as e:
+        print(f"Notice: Cloud Logging query encountered: {e}", file=sys.stderr)
+    return []
+
+
+def tail_deployment_logs(
+    deployment: Dict[str, Any],
+    follow: bool = False,
+    lines: int = 50,
+    raw: bool = False,
+) -> None:
+    """
+    Tails and formats Cloud Logging container logs for Vertex AI Endpoint or GCE deployment.
+    Supports real-time streaming with --follow.
+    """
+    platform = deployment.get("platform", "vertex")
+    name = (
+        deployment.get("endpoint_id")
+        or deployment.get("endpoint_numeric_id")
+        or deployment.get("endpoint_name")
+        or deployment.get("instance_name")
+        or deployment.get("id")
+    )
+    project = deployment.get("project") or db.detect_gcp_project() or ""
+    region = deployment.get("region", "us-central1")
+
+    if platform == "vertex":
+        numeric_id = resolve_endpoint_numeric_id(name, region, project)
+        log_filter = build_vertex_log_filter(numeric_id)
+        display_target = f"Vertex AI Endpoint: {name} (ID: {numeric_id})"
+    else:
+        numeric_id = name
+        log_filter = build_gce_log_filter(name)
+        display_target = f"Compute Engine VM: {name}"
+
+    print("=" * 80)
+    print(f"📡 [fulcrum status] Tailing Cloud Logging for {display_target}")
+    print(f"   Platform: {platform.upper()} | Project: {project} | Region: {region}")
+    print(f"   Filter:   {log_filter}")
+    print("=" * 80)
+    print(f"Fetching initial {lines} log entries...\n")
+
+    entries = fetch_cloud_logs(log_filter, project, limit=lines)
+    if not entries:
+        print("   No container logs recorded yet. The container image may still be downloading,")
+        print("   or physical hardware allocation is in progress.\n")
+    else:
+        for entry in entries:
+            if raw:
+                print(json.dumps(entry, indent=2))
+            else:
+                print(format_vllm_log_entry(entry))
+
+    if not follow:
+        return
+
+    latest_ts = entries[-1].get("timestamp") if entries else None
+    seen_ids = {e.get("insertId") for e in entries if e.get("insertId")}
+
+    print(f"\n--- Following live container logs (polling every 3s — Press Ctrl+C to stop) ---")
+    try:
+        while True:
+            time.sleep(3)
+            poll_filter = (
+                build_vertex_log_filter(numeric_id, min_timestamp=latest_ts)
+                if platform == "vertex"
+                else build_gce_log_filter(name, min_timestamp=latest_ts)
+            )
+            new_entries = fetch_cloud_logs(poll_filter, project, limit=50)
+            for entry in new_entries:
+                iid = entry.get("insertId")
+                if iid and iid in seen_ids:
+                    continue
+                if iid:
+                    seen_ids.add(iid)
+                latest_ts = entry.get("timestamp") or latest_ts
+                if raw:
+                    print(json.dumps(entry, indent=2))
+                else:
+                    print(format_vllm_log_entry(entry))
+    except KeyboardInterrupt:
+        print("\n[fulcrum status] Log streaming terminated by user.")
+
+
 def inspect_deployment(deployment: Dict[str, Any]) -> Dict[str, Any]:
     """Inspects live state for a single deployment and updates record if changed."""
     platform = deployment.get("platform", "gce")
@@ -209,6 +417,8 @@ def inspect_deployment(deployment: Dict[str, Any]) -> Dict[str, Any]:
             op_state, op_done, op_err = query_vertex_operation(operation_id, region, project)
             if not op_done and op_state in ("RUNNING", "PENDING"):
                 vertex_state = "PROVISIONING"
+            elif op_done and op_state == "FAILED":
+                vertex_state = "FAILED"
             elif op_done and op_state in ("STOCKOUT", "FAILED"):
                 vertex_state = op_state
 
@@ -347,6 +557,7 @@ def print_verbose_details(inspections: List[Dict[str, Any]]) -> None:
             if item.get("operation_state"):
                 print(f"  Operation State:   {item.get('operation_state')}")
             if item.get("operation_error"):
+                print(f"  Operation Error:   {item.get('operation_error')}")
                 op_err = str(item.get("operation_error", ""))
                 print(f"  Operation Error:   {op_err}")
                 if item.get("live_status") == "STOCKOUT" or item.get("status") == "STOCKOUT" or "code: 14" in op_err.lower() or "temporarily unavailable" in op_err.lower():
@@ -394,6 +605,12 @@ Examples:
   # Filter by specific deployment ID with detailed diagnostics
   python3 fulcrum/scripts/status_deployment.py --id fulcrum-gemma-3-12b-it --verbose
 
+  # Tail container logs from Cloud Logging
+  python3 fulcrum/scripts/status_deployment.py --id fulcrum-gemma-3-12b-it --logs
+
+  # Follow live container logs in real time
+  python3 fulcrum/scripts/status_deployment.py --id fulcrum-gemma-3-12b-it --logs --follow
+
   # Output as JSON
   python3 fulcrum/scripts/status_deployment.py --format json
 
@@ -405,8 +622,52 @@ Examples:
     parser.add_argument("--format", choices=["table", "json"], default="table", help="Output display format (default: table)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Display full diagnostic information and curl endpoints")
     parser.add_argument("--watch", "-w", type=int, help="Poll and refresh status every N seconds")
+    parser.add_argument("--logs", action="store_true", help="Fetch and format container logs from Cloud Logging")
+    parser.add_argument("--follow", "-f", action="store_true", help="Follow and stream live container logs in real time")
+    parser.add_argument("--lines", "-n", type=int, default=50, help="Number of recent log lines to retrieve (default: 50)")
+    parser.add_argument("--raw", action="store_true", help="Display raw unformatted JSON log payloads")
 
     args = parser.parse_args()
+
+    # Handle Cloud Logging tailing mode
+    if args.logs or args.follow:
+        deployments = db.load_deployments()
+        target = None
+        if args.identifier:
+            matches = [
+                d for d in deployments
+                if d.get("id") == args.identifier
+                or d.get("instance_name") == args.identifier
+                or d.get("endpoint_name") == args.identifier
+                or d.get("endpoint_id") == args.identifier
+            ]
+            if matches:
+                target = matches[0]
+            else:
+                project = db.detect_gcp_project() or ""
+                target = {
+                    "id": args.identifier,
+                    "platform": "vertex",
+                    "endpoint_name": args.identifier,
+                    "endpoint_id": args.identifier,
+                    "project": project,
+                    "region": "us-central1",
+                }
+        else:
+            if len(deployments) == 1:
+                target = deployments[0]
+            elif len(deployments) > 1:
+                print("Error: Multiple deployments found. Please specify --id <id>:", file=sys.stderr)
+                for d in deployments:
+                    d_id = d.get("id") or d.get("endpoint_name") or d.get("instance_name")
+                    print(f"  - {d_id} ({d.get('platform')})", file=sys.stderr)
+                sys.exit(1)
+            else:
+                print("Error: No deployments found in local registry. Specify --id <id> to inspect.", file=sys.stderr)
+                sys.exit(1)
+
+        tail_deployment_logs(target, follow=args.follow, lines=args.lines, raw=args.raw)
+        return
 
     while True:
         deployments = db.load_deployments()
@@ -416,6 +677,7 @@ Examples:
                 if d.get("id") == args.identifier
                 or d.get("instance_name") == args.identifier
                 or d.get("endpoint_name") == args.identifier
+                or d.get("endpoint_id") == args.identifier
             ]
 
         inspections = [inspect_deployment(d) for d in deployments]

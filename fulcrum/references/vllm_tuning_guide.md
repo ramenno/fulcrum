@@ -201,3 +201,29 @@ For models with extreme context windows (e.g. Kimi K3 with 200k+ tokens or DeepS
   ```
   When `--retry-transient` is enabled, Fulcrum catches Code 14, logs an explanation banner, and executes exponential backoff retries (`delay = retry_delay * (1.5 ** attempt)`). As demonstrated in production sessions, retrying 15 minutes later succeeded immediately once nodes became free.
 
+---
+
+## 10. Dedicated Cloud Logging & Live Container Telemetry
+
+Vertex AI exposes minimal startup feedback in the Google Cloud Console while a container is booting, streaming weights, or compiling XLA graphs. Fulcrum provides a native logging engine embedded directly in `/fulcrum status`.
+
+### Architecture:
+- **Numeric Endpoint ID Resolution**: Cloud Logging labels container output under `resource.type="aiplatform.googleapis.com/Endpoint"` and `resource.labels.endpoint_id="<NUMERIC_ID>"`. Fulcrum automatically translates user-friendly endpoint display names into the canonical numeric ID required by the Cloud Logging API.
+- **Semantic Component Tagging**: Rather than dumping unparsed JSON blobs, Fulcrum cleanses log entries and categorises them into high-visibility component tags:
+  - `[Weight Streaming]`: Progress of checkpoint downloading (safetensors shards, GCS stage transfers).
+  - `[JAX/XLA Compilation]`: Ahead-Of-Time TPU compilation progress across sequence buckets (`128`, `256`, `512`, `1024`, `2048`, `4096`).
+  - `[vLLM EngineCore]`: Core model runner initialisation, tensor parallel worker rank assignment, and KV-cache allocation.
+  - `[vLLM APIServer]`: HTTP routing, FastAPI/Uvicorn listener status, and OpenAI-compatible `/v1/chat/completions` readiness.
+  - `[Error]` / `[Warning]`: Highlighted warning and error messages.
+
+### Command Usage:
+```bash
+# Fetch and format recent 50 container log entries:
+.venv/bin/python3 fulcrum/scripts/status_deployment.py --id <resource-name> --logs
+
+# Stream and follow live container startup logs in real time:
+.venv/bin/python3 fulcrum/scripts/status_deployment.py --id <resource-name> --logs --follow
+
+# Inspect raw JSON log payloads for low-level debugging:
+.venv/bin/python3 fulcrum/scripts/status_deployment.py --id <resource-name> --logs --raw
+```

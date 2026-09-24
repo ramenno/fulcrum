@@ -125,6 +125,8 @@ Use `/fulcrum run` to provision and launch a downloadable open-weight model on G
    - Large models (27B–70B+) on Cloud TPU or multi-GPU topologies require image pulling, streaming 50+ GiB of weights, and Ahead-Of-Time (AOT) JAX/XLA graph compilation, routinely taking 35–45 minutes.
    - Synchronous `gcloud ai endpoints deploy-model` terminates at 1,800 seconds (30 minutes) with a client socket timeout and rejects `--async`.
    - `/fulcrum run` natively dispatches deployments asynchronously via the Vertex AI REST API (`POST ...:deployModel`), capturing the Operation ID in <1 second and delegating monitoring to an internal progress poller (`gcloud ai operations describe`) with real-time stage updates up to 7,200s (2 hours).
+   - If standard `gcloud` CLI hits the 1,800s timeout, Fulcrum automatically intercepts the active Operation ID from stderr and seamlessly hands off to the operation poller without aborting.
+5. **Direct Provisioning & Execution**:
     - If standard `gcloud` CLI hits the 1,800s timeout, Fulcrum automatically intercepts the active Operation ID from stderr and seamlessly hands off to the operation poller without aborting.
 5. **Handling Transient Datacentre Allocation Stock-Outs (Code 14 UNAVAILABLE)**:
    - High-demand accelerators (Cloud TPU `ct6e-standard-4t`, NVIDIA H100s) can encounter temporary node contention: `code: 14: Machine type temporarily unavailable`.
@@ -149,6 +151,7 @@ Use `/fulcrum run` to provision and launch a downloadable open-weight model on G
    .venv/bin/python3 fulcrum/scripts/launch_gcp.py --model <huggingface-id> --platform gce
    ```
    Add `--record` to register the planned deployment into the local state database immediately.
+6. **Dry-Run & Infrastructure-as-Code Generation**:
 7. **Dry-Run & Infrastructure-as-Code Generation**:
    If the user specifically requests a preview of deployment commands without provisioning infrastructure, or requests Terraform/JSON definitions, pass `--dry-run` or `--format`:
    ```bash
@@ -180,11 +183,24 @@ Use `/fulcrum status` to check the status, health, and live utilisation metrics 
    .venv/bin/python3 fulcrum/scripts/status_deployment.py --id <resource-name> --verbose
    ```
 3. **Continuous Monitoring**:
+3. **Dedicated Cloud Logging Tailer**:
+   Stream and tail container logs with automatic component formatting (`[vLLM EngineCore]`, `[vLLM APIServer]`, `[Weight Streaming]`, `[JAX/XLA Compilation]`):
+   ```bash
+   # Tail recent 50 lines:
+   .venv/bin/python3 fulcrum/scripts/status_deployment.py --id <resource-name> --logs
+
+   # Follow live container startup, weight streaming, and compilation in real time:
+   .venv/bin/python3 fulcrum/scripts/status_deployment.py --id <resource-name> --logs --follow
+   ```
+4. **Continuous Monitoring**:
    Use `--watch <seconds>` to monitor live traffic and memory utilisation continuously.
 
 ### Metrics Monitored:
+### Metrics & Diagnostics Monitored:
 - **Platform**: `VERTEX` vs `GCE`.
+- **Lifecycle Status**: Vertex Endpoint state (`ACTIVE`, `NO_MODELS`) or GCE VM status (`RUNNING`, `TERMINATED`).
 - **Lifecycle Status**: Vertex Endpoint state (`ACTIVE`, `NO_MODELS`, `PROVISIONING`, `STOCKOUT`, `FAILED`) or GCE VM status (`RUNNING`, `TERMINATED`).
+- **Live Container Logs**: Filtered Cloud Logging output formatted by component.
 - **Diagnosis**: High-visibility diagnostic banners for transient datacentre stock-outs (`Code 14 UNAVAILABLE`) with actionable suggestions.
 - **Health**: Service health probe against `/health`.
 - **KV Cache & Concurrency**: Scraped from vLLM Prometheus metrics for GCE instances.
