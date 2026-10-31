@@ -47,11 +47,85 @@ def formulate_recommendations(
     workload: str,
     max_context: int,
     expected_concurrency: int,
+    engine: str = "vllm",
 ) -> Dict[str, Any]:
-    """Generates optimal vLLM parameters based on hardware capabilities and workload goals."""
+    """Generates optimal vLLM or Strata MoE parameters based on hardware capabilities and workload goals."""
     arch = get_gpu_architecture(gpu_type)
     flags: Dict[str, Any] = {}
     rationales: List[str] = []
+
+    if engine.lower() == "strata":
+        mid = model.lower()
+        is_massive_moe = any(h in mid for h in ("125b", "141b", "8x22b", "flash-next", "70b", "72b", "671b"))
+        vram_gb = 22 * gpu_count
+        ram_gb = 96 if is_massive_moe else 48
+        machine_rec = "g2-standard-32 (128 GB RAM)" if is_massive_moe else "g2-standard-16 (64 GB RAM)"
+
+        flags["--vram"] = vram_gb
+        flags["--ram"] = ram_gb
+        flags["--vram-reserve-mib"] = 2048
+        flags["--expert-cache"] = "auto"
+        flags["--evict"] = "lfu"
+        flags["--kv"] = "int8"
+        flags["--prefill"] = "auto"
+        flags["--max-context"] = max_context
+        flags["--port"] = 8000
+
+        rationales.append(
+            f"3-Tier MoE Memory Hierarchy: Pin attention, router, shared experts, and hot routed experts in {vram_gb} GiB GPU VRAM (--vram {vram_gb}), "
+            f"stage warm experts in {ram_gb} GiB Host System RAM (--ram {ram_gb} on {machine_rec}), and stream cold experts from Local NVMe SSD (/mnt/nvme)."
+        )
+        rationales.append(
+            "Reserved 2,048 MiB VRAM headroom (--vram-reserve-mib 2048) for CUDA context, workspace scratch buffers, and asynchronous PCIe Gen4 H2D expert transfers."
+        )
+        rationales.append(
+            "Enabled LFU (Least-Frequently-Used) expert cache eviction (--expert-cache auto --evict lfu) to retain high-activation power-law experts resident in GPU VRAM."
+        )
+        rationales.append(
+            "Enabled INT8 KV cache quantisation (--kv int8) to halve KV cache memory footprint in VRAM and leave maximum capacity for hot MoE expert slots."
+        )
+
+        if workload == "latency":
+            flags["--spec"] = 3
+            flags["--mtp"] = "auto"
+            flags["--spec-min-p"] = 0.1
+            flags["--skip-w"] = 0.02
+            flags["--prompt-skip-w"] = 0.03
+            rationales.append(
+                "Enabled Multi-Token Prediction / speculative decoding (--spec 3 --mtp auto --spec-min-p 0.1) to amortise expert weight transfers across multiple drafted tokens."
+            )
+            rationales.append(
+                "Configured low-weight expert skipping (--skip-w 0.02 --prompt-skip-w 0.03) to bypass tail router experts with negligible routing weight (<2%), cutting PCIe transfer stalls."
+            )
+        elif workload == "throughput":
+            flags["--pcie-frac"] = 0.85
+            rationales.append(
+                "Allocated 85% PCIe Gen4 bandwidth budget (--pcie-frac 0.85) for asynchronous layer-ahead expert prefetching under sustained batch generation."
+            )
+        else:
+            rationales.append(
+                "Hybrid prefill mode (--prefill auto) dynamically balances batched CPU/GPU expert execution during prompt ingestion."
+            )
+
+        cmd_parts = [f"strata-cli serve \\\n    --model {model}"]
+        for k, v in flags.items():
+            if isinstance(v, bool):
+                if v:
+                    cmd_parts.append(k)
+            else:
+                cmd_parts.append(f"{k} {v}")
+        full_command = " \\\n    ".join(cmd_parts)
+
+        return {
+            "engine": "strata",
+            "model": model,
+            "gpu_type": gpu_type,
+            "gpu_count": gpu_count,
+            "workload": workload,
+            "flags": flags,
+            "rationales": rationales,
+            "command": full_command,
+        }
 
     # Tensor Parallelism
     flags["--tensor-parallel-size"] = gpu_count
@@ -189,6 +263,7 @@ def formulate_recommendations(
     full_command = " \\\n    ".join(cmd_parts)
 
     return {
+        "engine": "vllm",
         "model": model,
         "gpu_type": gpu_type,
         "gpu_count": gpu_count,
@@ -391,13 +466,14 @@ Examples:
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     # Subcommand: advise
-    advise_parser = subparsers.add_parser("advise", help="Calculate optimal vLLM flags for target hardware and workload")
+    advise_parser = subparsers.add_parser("advise", help="Calculate optimal vLLM or Strata flags for target hardware and workload")
     advise_parser.add_argument("--model", "-m", type=str, required=True, help="Model ID (e.g. google/gemma-3-12b-it)")
     advise_parser.add_argument("--gpu-type", type=str, default="nvidia-l4", help="GPU type (nvidia-l4, nvidia-tesla-a100, nvidia-h100-80gb)")
     advise_parser.add_argument("--gpu-count", type=int, default=1, help="GPU count (default: 1)")
     advise_parser.add_argument("--workload", "-w", choices=["throughput", "latency", "balanced"], default="balanced", help="Optimisation goal")
     advise_parser.add_argument("--max-context", type=int, default=8192, help="Target context window length (default: 8192)")
     advise_parser.add_argument("--concurrency", "-c", type=int, default=16, help="Expected concurrent request count (default: 16)")
+    advise_parser.add_argument("--engine", choices=["vllm", "strata"], default="vllm", help="Inference engine runtime: vllm (default) or strata (3-tier MoE)")
     advise_parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
 
     # Subcommand: benchmark
@@ -420,6 +496,7 @@ Examples:
             workload=args.workload,
             max_context=args.max_context,
             expected_concurrency=args.concurrency,
+            engine=args.engine,
         )
 
         if args.format == "json":
@@ -428,6 +505,7 @@ Examples:
             print("=" * 80)
             print(f"  /fulcrum optimise: Tuning Formulation for {args.model}")
             print("=" * 80)
+            print(f"Inference Engine:    {'Strata MoE (3-Tier Dynamic Expert Streaming)' if args.engine == 'strata' else 'vLLM'}")
             print(f"Hardware Target:     {args.gpu_count}x {args.gpu_type}")
             print(f"Optimisation Goal:   {args.workload.capitalize()}")
             print(f"Context Window:      {args.max_context} tokens")
@@ -437,7 +515,7 @@ Examples:
             for idx, r in enumerate(rec["rationales"], 1):
                 print(f"  {idx}. {r}")
             print("-" * 80)
-            print("Optimised vLLM Serving Command:")
+            print(f"Optimised {'Strata' if args.engine == 'strata' else 'vLLM'} Serving Command:")
             print(f"  {rec['command']}")
             print("=" * 80)
 

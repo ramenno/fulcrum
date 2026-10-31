@@ -150,6 +150,28 @@ assert b_safe['effective_max_model_len'] == 8192
 assert b_safe['max_safe_context'] > 8192
 """
     run(f'.venv/bin/python3 -c "{code_budget}"')
+
+    # Test Strata MoE model search and 3-tier sizing
+    p_strata = run(".venv/bin/python3 fulcrum/scripts/find_model.py --engine strata --moe-only --vram-limit 24 --format json")
+    data_strata = json.loads(p_strata.stdout)
+    assert len(data_strata) >= 4, "Expected at least 4 MoE models fitting 24GB VRAM via Strata"
+    strata_ids = {item["metadata"]["id"] for item in data_strata}
+    assert "Qwen/Qwen3.8-Flash-Next" in strata_ids
+    assert "Qwen/Qwen3.6-35B-A3B" in strata_ids
+    assert "mistralai/Mixtral-8x22B-Instruct-v0.1" in strata_ids
+    assert "deepseek-ai/DeepSeek-V2-Lite-Chat" in strata_ids
+    for item in data_strata:
+        assert item["metadata"]["active_parameters_billion"] < item["metadata"]["parameters_billion"]
+        hc = item["hardware_calc"]
+        assert hc.get("is_moe") is True
+        assert hc.get("recommended_strata") is not None
+        assert hc["recommended_strata"]["vram"] == 24
+        assert hc["recommended_strata"]["local_nvme_gb"] == 375
+        assert "strata-cli serve" in hc.get("strata_command", "")
+
+    p_strata_tbl = run(".venv/bin/python3 fulcrum/scripts/find_model.py --engine strata --moe-only --vram-limit 24")
+    assert "STRATA GCE NODE (NVMe)" in p_strata_tbl.stdout
+    assert "Strata MoE Node:" in p_strata_tbl.stdout
     print("find_model.py: PASSED")
 
 
@@ -390,6 +412,34 @@ assert is_tpu_machine('g2-standard-48') is False
     assert "--retry-transient" in p_help.stdout
     assert "--max-retries" in p_help.stdout
     assert "--retry-delay" in p_help.stdout
+    assert "--engine" in p_help.stdout
+    assert "--strata-ram" in p_help.stdout
+    assert "--local-ssd" in p_help.stdout
+    assert "--expert-evict" in p_help.stdout
+
+    # 22. Test Strata MoE engine platform routing, machine sizing, and GCE NVMe provisioning
+    from fulcrum.scripts.launch_gcp import evaluate_platform_viability, resolve_machine_type
+    plat_s, rat_s = evaluate_platform_viability("Qwen/Qwen3.8-Flash-Next", "nvidia-l4", 1, "auto", engine="strata")
+    assert plat_s == "gce"
+    assert "Strata" in rat_s
+    assert resolve_machine_type("nvidia-l4", 1, platform="gce", engine="strata", model_id="Qwen/Qwen3.8-Flash-Next") == "g2-standard-32"
+    assert resolve_machine_type("nvidia-l4", 1, platform="gce", engine="strata", model_id="Qwen/Qwen3.6-35B-A3B") == "g2-standard-16"
+
+    p_strata_gce = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen3.8-Flash-Next --engine strata --no-check-quota --format json")
+    data_strata_gce = json.loads(p_strata_gce.stdout)
+    assert data_strata_gce["engine"] == "strata"
+    assert data_strata_gce["platform"] == "gce"
+    assert data_strata_gce["machine_type"] == "g2-standard-32"
+    assert data_strata_gce["local_ssd_count"] == 1
+    assert "--local-ssd=interface=NVME" in data_strata_gce["create_command"]
+    assert "strata-cli serve" in data_strata_gce["startup_script"]
+    assert "--vram 22" in data_strata_gce["startup_script"]
+    assert "--ram 96" in data_strata_gce["startup_script"]
+    assert "--evict lfu" in data_strata_gce["startup_script"]
+
+    p_strata_tf = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen3.8-Flash-Next --engine strata --no-check-quota --format terraform")
+    assert 'scratch_disk {' in p_strata_tf.stdout
+    assert 'interface = "NVME"' in p_strata_tf.stdout
 
     if os.path.exists(test_db):
         os.remove(test_db)
@@ -604,6 +654,18 @@ def test_optimise_deployment() -> None:
     assert any("Pallas" in r for r in data_tpu_opt["rationales"])
     assert any("Static Sequence Length Bucketing" in r for r in data_tpu_opt["rationales"])
     assert any("Do NOT pass --accelerator" in r for r in data_tpu_opt["rationales"])
+
+    # Test Strata MoE optimisation advice
+    p_strata_opt = run(".venv/bin/python3 fulcrum/scripts/optimise_deployment.py advise --model Qwen/Qwen3.8-Flash-Next --engine strata --workload latency --format json")
+    data_strata_opt = json.loads(p_strata_opt.stdout)
+    assert data_strata_opt["engine"] == "strata"
+    assert data_strata_opt["flags"]["--vram"] == 22
+    assert data_strata_opt["flags"]["--ram"] == 96
+    assert data_strata_opt["flags"]["--evict"] == "lfu"
+    assert data_strata_opt["flags"]["--kv"] == "int8"
+    assert data_strata_opt["flags"]["--spec"] == 3
+    assert "strata-cli serve" in data_strata_opt["command"]
+    assert any("3-Tier MoE Memory Hierarchy" in r for r in data_strata_opt["rationales"])
     print("optimise_deployment.py: PASSED")
 
 

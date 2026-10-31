@@ -125,12 +125,18 @@ def is_tpu_machine(machine_type: Optional[str]) -> bool:
     return mt.startswith("ct5lp-") or mt.startswith("ct6e-") or mt.startswith("ct5p-") or mt.startswith("ct")
 
 
-def resolve_machine_type(gpu_type: str, gpu_count: int, platform: str = "vertex") -> str:
+def resolve_machine_type(
+    gpu_type: str,
+    gpu_count: int,
+    platform: str = "vertex",
+    engine: str = "vllm",
+    model_id: str = "",
+) -> str:
     """
     Resolves the exact GCP machine type adhering to rigid hardware topologies.
     Guarantees G2 instances always pair strictly:
-      1x L4 -> g2-standard-8
-      2x L4 -> g2-standard-24 (g2-standard-16 is strictly rejected by GCP API)
+      1x L4 -> g2-standard-8 (default vLLM) or g2-standard-16 / g2-standard-32 (Strata MoE 64GB/128GB RAM)
+      2x L4 -> g2-standard-24
       4x L4 -> g2-standard-48
       8x L4 -> g2-standard-96
     Supports Cloud TPU instances on Vertex AI:
@@ -150,6 +156,13 @@ def resolve_machine_type(gpu_type: str, gpu_count: int, platform: str = "vertex"
         return f"ct5lp-hightpu-{gpu_count}t"
 
     if "l4" in g_lower:
+        # Strata MoE 3-tier hierarchy requires expanded System RAM on a single L4 GPU:
+        # g2-standard-16 (1x L4, 64 GB RAM) for <=35B MoEs; g2-standard-32 (1x L4, 128 GB RAM) for >=70B MoEs
+        if engine.lower() == "strata" and gpu_count == 1:
+            mid = (model_id or "").lower()
+            if any(h in mid for h in ("125b", "141b", "8x22b", "flash-next", "70b", "72b", "671b")):
+                return "g2-standard-32"
+            return "g2-standard-16"
         return G2_L4_TOPOLOGY.get(gpu_count, f"g2-standard-{gpu_count * 8}")
 
     mapping = VERTEX_MACHINE_MAP if platform == "vertex" else GCE_MACHINE_MAP
@@ -191,17 +204,24 @@ def resolve_gcp_project(explicit_project: Optional[str] = None) -> str:
     return db.resolve_gcp_project(explicit_project)
 
 
-def estimate_gpu_needs(model_id: str) -> Tuple[str, int]:
+def estimate_gpu_needs(model_id: str, engine: str = "vllm") -> Tuple[str, int]:
     """Infers suitable GPU type and count from model parameter hints."""
+    if engine.lower() == "strata":
+        # Strata MoE dynamic expert streaming holds active attention/router + hot experts
+        # on 1x NVIDIA L4 (24 GB VRAM) while offloading warm/cold experts to System RAM & NVMe
+        return "nvidia-l4", 1
+
     mid = model_id.lower()
     if "671b" in mid:
         # DeepSeek-R1 full MoE requires multi-node cluster (>8 GPUs)
         return "nvidia-h100-80gb", 16
+    elif "125b" in mid or "141b" in mid or "8x22b" in mid:
+        return "nvidia-a100-80gb", 2
     elif "70b" in mid or "72b" in mid:
         return "nvidia-a100-80gb", 1
-    elif "27b" in mid or "32b" in mid or "24b" in mid:
+    elif "27b" in mid or "32b" in mid or "35b" in mid or "24b" in mid:
         return "nvidia-l4", 4
-    elif "12b" in mid or "14b" in mid:
+    elif "12b" in mid or "14b" in mid or "16b" in mid or "v2-lite" in mid:
         return "nvidia-l4", 1
     elif any(f"{x}b" in mid for x in [1, 2, 3, 4, 7, 8, 9]):
         return "nvidia-l4", 1
@@ -214,6 +234,7 @@ def evaluate_platform_viability(
     gpu_type: str,
     gpu_count: int,
     requested_platform: str = "auto",
+    engine: str = "vllm",
 ) -> Tuple[str, str]:
     """
     Evaluates whether Vertex AI Endpoint is viable for the requested model and hardware.
@@ -227,6 +248,14 @@ def evaluate_platform_viability(
         return "gce", "Compute Engine (GCE) explicitly requested by user."
     if req == "gke":
         return "gke", "Google Kubernetes Engine (GKE) explicitly requested by user."
+
+    # Check 0: Strata MoE 3-tier memory hierarchy (GPU VRAM + System RAM + Local NVMe SSD)
+    if engine.lower() == "strata":
+        return (
+            "gce",
+            "Strata MoE engine requires a 3-tier memory hierarchy (GPU VRAM + 64-128 GB Host System RAM "
+            "+ Local NVMe SSD scratch disks) for dynamic sparse-router expert streaming; routing to Compute Engine (GCE).",
+        )
 
     # Auto-detection mode: Vertex AI Endpoint is the primary choice whenever viable.
     # Check 1: Multi-node distributed inference (>8 GPUs)
@@ -891,6 +920,72 @@ echo "Warning: Service startup did not complete within 5 minutes."
 """
 
 
+def generate_strata_startup_script(
+    model: str,
+    port: int,
+    max_model_len: int,
+    vram_gb: int = 22,
+    ram_gb: int = 48,
+    vram_reserve_mib: int = 2048,
+    evict: str = "lfu",
+    hf_token: Optional[str] = None,
+) -> str:
+    """
+    Generates shell script embedded into GCE instance metadata to configure Local NVMe SSD
+    scratch storage and launch the Strata MoE 3-tier dynamic expert-streaming engine.
+    """
+    token_export = f'export HF_TOKEN="{hf_token}"\n' if hf_token else ""
+
+    return f"""#!/bin/bash
+set -euxo pipefail
+
+echo "=== Fulcrum Strata MoE 3-Tier Compute Engine Node Initialisation ==="
+{token_export}
+# 1. Verify NVIDIA GPU driver
+nvidia-smi || exit 1
+
+# 2. Format and mount Local NVMe SSD scratch disk (Tier 3 cold expert cache & model weights)
+mkdir -p /mnt/nvme
+if [ -b /dev/nvme0n1 ]; then
+    mkfs.ext4 -F /dev/nvme0n1 || true
+    mount -o discard,defaults /dev/nvme0n1 /mnt/nvme || true
+    chmod 777 /mnt/nvme
+fi
+export HF_HOME="/mnt/nvme/huggingface"
+export STRATA_CACHE_DIR="/mnt/nvme/strata-cache"
+mkdir -p "$HF_HOME" "$STRATA_CACHE_DIR"
+
+# 3. Install or update Strata CLI (stratallm.org)
+if ! command -v strata-cli &> /dev/null; then
+    curl -fsSL https://stratallm.org/install.sh | sh || pip install strata-llm
+fi
+
+# 4. Launch Strata MoE server with 3-tier dynamic sparse-router expert offloading
+nohup strata-cli serve \\
+    --model {model} \\
+    --port {port} \\
+    --vram {vram_gb} \\
+    --ram {ram_gb} \\
+    --vram-reserve-mib {vram_reserve_mib} \\
+    --expert-cache auto \\
+    --evict {evict} \\
+    --kv int8 \\
+    --prefill auto \\
+    --max-context {max_model_len} \\
+    > /var/log/strata-serve.log 2>&1 &
+
+echo "=== Initialisation Complete. Probing /health on port {port}... ==="
+for i in $(seq 1 60); do
+    if curl -s "http://localhost:{port}/health" > /dev/null; then
+        echo "Strata MoE service is healthy!"
+        exit 0
+    fi
+    sleep 5
+done
+echo "Warning: Service startup did not complete within 5 minutes."
+"""
+
+
 def generate_terraform(
     instance_name: str,
     project: str,
@@ -902,6 +997,7 @@ def generate_terraform(
     startup_script: str,
     port: int,
     spot: bool = False,
+    local_ssd: int = 0,
 ) -> str:
     """Generates Terraform HCL configuration for Compute Engine fallback."""
     spot_block = (
@@ -910,6 +1006,9 @@ def generate_terraform(
         if spot
         else ""
     )
+    scratch_blocks = ""
+    for _ in range(max(0, local_ssd)):
+        scratch_blocks += '\n  scratch_disk {\n    interface = "NVME"\n  }\n'
 
     return f"""# Terraform Configuration for Compute Engine Fallback: {instance_name}
 terraform {{
@@ -952,7 +1051,7 @@ resource "google_compute_instance" "vllm_node" {{
       type  = "pd-ssd"
     }}
   }}
-
+{scratch_blocks}
   guest_accelerator {{
     type  = "{gpu_type}"
     count = {gpu_count}
@@ -1080,9 +1179,33 @@ Examples:
     parser.add_argument("--max-model-len", type=int, default=8192, help="Maximum context sequence length (default: 8192)")
     parser.add_argument(
         "--quantization",
-        choices=["none", "fp8", "awq", "gptq"],
+        choices=["none", "fp8", "awq", "gptq", "gsq-rco", "gguf-q4"],
         default="none",
         help="Quantisation mode (default: none)",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["vllm", "strata"],
+        default="vllm",
+        help="Inference engine runtime: vllm (default) or strata (3-tier MoE dynamic expert streaming on GCE)",
+    )
+    parser.add_argument(
+        "--strata-ram",
+        type=int,
+        default=None,
+        help="Host System RAM budget in GiB for Strata warm expert cache (default: 48 on g2-standard-16, 96 on g2-standard-32)",
+    )
+    parser.add_argument(
+        "--local-ssd",
+        type=int,
+        default=None,
+        help="Number of 375 GB Local NVMe SSD scratch disks to attach on GCE (default: 1 when --engine strata, else 0)",
+    )
+    parser.add_argument(
+        "--expert-evict",
+        choices=["lfu", "lru"],
+        default="lfu",
+        help="Strata MoE expert cache eviction policy (default: lfu)",
     )
     parser.add_argument("--hf-token", type=str, help="Hugging Face API token for gated models (or set HF_TOKEN env)")
     parser.add_argument("--tensor-parallel-size", type=int, help="Tensor parallelism degrees (defaults to GPU/TPU count)")
@@ -1229,17 +1352,18 @@ Examples:
                 args.zone = f"{region}-a"
     else:
         # Infer GPU requirements if not explicitly supplied
-        inferred_gpu, inferred_count = estimate_gpu_needs(args.model)
+        inferred_gpu, inferred_count = estimate_gpu_needs(args.model, engine=args.engine)
         gpu_type = args.gpu_type or inferred_gpu
         gpu_count = args.gpu_count or inferred_count
         tensor_parallel = args.tensor_parallel_size or min(gpu_count, 8)
 
-    # Evaluate platform viability (Vertex Endpoint priority)
+    # Evaluate platform viability (Vertex Endpoint priority, GCE for Strata MoE 3-tier hierarchy)
     platform, rationale = evaluate_platform_viability(
         model_id=args.model,
         gpu_type=gpu_type,
         gpu_count=gpu_count,
         requested_platform=args.platform,
+        engine=args.engine,
     )
 
     # Derive resource name
@@ -1855,19 +1979,35 @@ Examples:
         return
 
     # =========================================================================
-    # TARGET 3: COMPUTE ENGINE (GCE) FALLBACK
+    # TARGET 3: COMPUTE ENGINE (GCE) FALLBACK / STRATA 3-TIER MOE DEPLOYMENT
     # =========================================================================
-    machine_type = args.machine_type or GCE_MACHINE_MAP.get((gpu_type, gpu_count), f"g2-standard-{gpu_count * 8}")
-    machine_type = args.machine_type or resolve_machine_type(gpu_type, gpu_count, platform="gce")
-    instance_name = resource_name
-    startup_script = generate_startup_script(
-        model=args.model,
-        port=args.port,
-        tensor_parallel=tensor_parallel,
-        max_model_len=effective_max_model_len,
-        quantization=args.quantization,
-        hf_token=hf_token,
+    machine_type = args.machine_type or resolve_machine_type(
+        gpu_type, gpu_count, platform="gce", engine=args.engine, model_id=args.model
     )
+    instance_name = resource_name
+    local_ssd_count = args.local_ssd if args.local_ssd is not None else (1 if args.engine == "strata" else 0)
+    strata_ram_gb = args.strata_ram or (96 if machine_type == "g2-standard-32" else 48)
+
+    if args.engine == "strata":
+        startup_script = generate_strata_startup_script(
+            model=args.model,
+            port=args.port,
+            max_model_len=effective_max_model_len,
+            vram_gb=22 * gpu_count,
+            ram_gb=strata_ram_gb,
+            vram_reserve_mib=2048,
+            evict=args.expert_evict,
+            hf_token=hf_token,
+        )
+    else:
+        startup_script = generate_startup_script(
+            model=args.model,
+            port=args.port,
+            tensor_parallel=tensor_parallel,
+            max_model_len=effective_max_model_len,
+            quantization=args.quantization,
+            hf_token=hf_token,
+        )
     script_path = f"/tmp/{instance_name}-startup.sh"
 
     firewall_cmd = (
@@ -1883,6 +2023,7 @@ Examples:
     )
 
     spot_flags = "    --provisioning-model=SPOT \\\n    --instance-termination-action=STOP \\\n" if args.spot else ""
+    local_ssd_flags = "".join("    --local-ssd=interface=NVME \\\n" for _ in range(max(0, local_ssd_count)))
 
     create_cmd = (
         f"gcloud compute instances create {instance_name} \\\n"
@@ -1890,6 +2031,7 @@ Examples:
         f"    --zone={args.zone} \\\n"
         f"    --machine-type={machine_type} \\\n"
         f"    --accelerator=type={gpu_type},count={gpu_count} \\\n"
+        f"{local_ssd_flags}"
         f"{spot_flags}"
         f"    --maintenance-policy=TERMINATE \\\n"
         f"    --image-family=common-cu124-debian-11 \\\n"
@@ -1913,6 +2055,7 @@ Examples:
                 startup_script=startup_script,
                 port=args.port,
                 spot=args.spot,
+                local_ssd=local_ssd_count,
             )
         )
         return
@@ -1920,6 +2063,7 @@ Examples:
     if args.format == "json":
         data = {
             "platform": "gce",
+            "engine": args.engine,
             "platform_rationale": rationale,
             "instance_name": instance_name,
             "project": project,
@@ -1927,6 +2071,8 @@ Examples:
             "machine_type": machine_type,
             "gpu_type": gpu_type,
             "gpu_count": gpu_count,
+            "local_ssd_count": local_ssd_count,
+            "strata_ram_gb": strata_ram_gb if args.engine == "strata" else None,
             "spot": args.spot,
             "disk_size_gb": args.disk_size,
             "port": args.port,
@@ -1941,14 +2087,19 @@ Examples:
 
     # Default bash presentation for GCE
     print("=" * 80)
-    print(f"  /fulcrum run: Compute Engine Fallback Specification for {args.model}")
+    print(f"  /fulcrum run: Compute Engine Specification for {args.model}")
     print("=" * 80)
     print(f"Target Platform:   Compute Engine (GCE GPU Virtual Machine)")
+    print(f"Inference Engine:  {'Strata MoE (3-Tier Dynamic Expert Streaming)' if args.engine == 'strata' else 'vLLM'}")
     print(f"Fallback Reason:   {rationale}")
     print(f"Target Project:    {project}")
     print(f"Zone:              {args.zone}")
     print(f"Machine Type:      {machine_type}")
     print(f"Accelerator:       {gpu_count}x {gpu_type}")
+    if local_ssd_count > 0:
+        print(f"Local NVMe SSD:    {local_ssd_count}x 375 GB NVMe scratch disk(s) (/mnt/nvme)")
+    if args.engine == "strata":
+        print(f"Strata Hierarchy:  22 GiB GPU VRAM + {strata_ram_gb} GiB Host RAM + {local_ssd_count * 375} GB NVMe SSD (Evict: {args.expert_evict.upper()})")
     if quota_report:
         q_icon = "✅" if quota_report["status"] == "SUFFICIENT" else ("❌" if quota_report["status"] == "INSUFFICIENT" else "⚠️")
         q_headroom = f" ({quota_report['available']:.0f} available / {quota_report['limit']:.0f} limit)" if quota_report.get("limit") is not None else ""
@@ -1970,6 +2121,7 @@ Examples:
     record_data = {
         "id": instance_name,
         "platform": "gce",
+        "engine": args.engine,
         "platform_rationale": rationale,
         "instance_name": instance_name,
         "model": args.model,
@@ -1979,6 +2131,7 @@ Examples:
         "machine_type": machine_type,
         "gpu_type": gpu_type,
         "gpu_count": gpu_count,
+        "local_ssd_count": local_ssd_count,
         "port": args.port,
         "quantization": args.quantization,
         "memory_budget": mem_budget,

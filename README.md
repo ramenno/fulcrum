@@ -3,13 +3,13 @@
 [![Agent Skills Standard](https://img.shields.io/badge/Agent_Skills-v2.0-blue.svg)](https://agentskills.io/)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Google Cloud Platform](https://img.shields.io/badge/GCP-Vertex%20AI%20%7C%20GCE%20%7C%20GKE-orange.svg)](https://cloud.google.com/)
-[![Serving Engine](https://img.shields.io/badge/Engine-vLLM%20%28GPU%20%26%20TPU%29-green.svg)](https://github.com/vllm-project/vllm)
+[![Serving Engine](https://img.shields.io/badge/Engine-vLLM%20%28GPU%20%26%20TPU%29%20%7C%20Strata%20MoE-green.svg)](https://github.com/vllm-project/vllm)
 [![Hardware](https://img.shields.io/badge/Hardware-NVIDIA%20L4%2FA100%2FH100%20%7C%20Cloud%20TPU%20v5e%2Fv6e%2Fv5p-purple.svg)](https://cloud.google.com/tpu)
 [![Licence](https://img.shields.io/badge/Licence-Apache--2.0-lightgrey.svg)](LICENSE)
 
 > *"Give me a lever long enough and a fulcrum on which to place it, and I shall move the world."* — Archimedes
 
-**Fulcrum** provides effortless leverage to discover, size, provision, monitor, optimise, and benchmark open-weight, downloadable, self-deployable models (e.g. Google Gemma, Meta Llama, Alibaba Qwen, DeepSeek, and Mistral) on **Google Cloud Platform (GCP)** across **NVIDIA GPUs** and **Cloud TPUs (v5e / v6e Trillium / v5p)**.
+**Fulcrum** provides effortless leverage to discover, size, provision, monitor, optimise, and benchmark open-weight, downloadable, self-deployable models (e.g. Google Gemma, Meta Llama, Alibaba Qwen, DeepSeek, and Mistral) on **Google Cloud Platform (GCP)** across **NVIDIA GPUs** and **Cloud TPUs (v5e / v6e Trillium / v5p)** using **vLLM** and the **Strata MoE** 3-tier dynamic expert-streaming engine.
 
 Built in strict compliance with the open [Agent Skills standard](https://agentskills.io/), Fulcrum serves both as an autonomous toolchain for AI coding agents and as a CLI suite for machine learning engineers. Grab a cup of fresh coffee ☕ and let Fulcrum handle the cloud infrastructure math, quota verifications, and deployment orchestration.
 
@@ -48,14 +48,13 @@ Fulcrum focuses **exclusively on open-weight models** whose checkpoints can be d
 
 ## Key Features
 
-- 🔍 **Hardware & VRAM Sizing (`/fulcrum find`)**: Calculates exact weight footprints, KV cache allocation, and activation overheads across BF16, FP8, AWQ, and INT4 precision formats. Maps footprints to NVIDIA GPUs and Cloud TPU topologies.
-- 🚀 **Vertex AI First Orchestration (`/fulcrum run`)**: Provisions **Vertex AI Endpoints** as the primary default using official Google Cloud vLLM container images. Automatically falls back to Compute Engine (or GKE) when Vertex is not viable.
-- 🛡️ **Pre-Flight Quota Auditing**: Verifies regional GPU (`NVIDIA_L4_GPUS`, `NVIDIA_A100_GPUS`) and Cloud TPU (`custom_model_serving_tpu_v5e_chips`, `custom_model_serving_tpu_v6e_chips`) quota prior to provisioning, preventing `RESOURCE_EXHAUSTED` deployment rejections.
+- 🔍 **Hardware & VRAM Sizing (`/fulcrum find`)**: Calculates exact weight footprints, KV cache allocation, and activation overheads across BF16, FP8, AWQ, INT4, and Strata GSQ-RCO precision formats. Maps footprints to NVIDIA GPUs, Cloud TPU topologies, and Strata 3-tier MoE hierarchies (1x L4 GPU VRAM + 64–128 GB System RAM + 375 GB Local NVMe SSD).
+- 🚀 **Vertex AI First Orchestration (`/fulcrum run`)**: Provisions **Vertex AI Endpoints** as the primary default using official Google Cloud vLLM container images. Automatically routes to Compute Engine (with Local NVMe SSD scratch disks) for `--engine strata` 3-tier MoE deployments or when Vertex is not viable.
 - 🛡️ **Pre-Flight Quota Auditing & Stock-Out Resilience**: Verifies regional GPU (`NVIDIA_L4_GPUS`, `NVIDIA_A100_GPUS`) and Cloud TPU (`custom_model_serving_tpu_v5e_chips`, `custom_model_serving_tpu_v6e_chips`) quota prior to provisioning, and gracefully handles transient datacentre node stock-outs (`Code 14 UNAVAILABLE`) with automated exponential backoff retries.
-- 📊 **Live Telemetry & State Monitoring (`/fulcrum status`)**: Scrapes vLLM Prometheus metrics (GPU/HBM KV cache utilisation %, request queue depth, active requests) and reports endpoint lifecycle state.
+- 📊 **Live Telemetry & State Monitoring (`/fulcrum status`)**: Scrapes vLLM Prometheus metrics (GPU/HBM KV cache utilisation %, request queue depth, active requests), streams Cloud Logging container logs (`--logs --follow`), and reports endpoint lifecycle state.
 - ⚡ **Benchmarking & Latency Sweeps (`/fulcrum benchmark`)**: Measures Time To First Token (TTFT), Time Per Output Token (TPOT), inter-token latency (ITL jitter), throughput, and concurrency saturation knees.
 - 💬 **Interactive Streaming Web Chat (`/fulcrum chat`)**: Single-file web interface featuring Server-Sent Events (SSE) token streaming, real-time performance telemetry heads-up display (HUD), and automatic Google Cloud IAM access token lifecycle management.
-- 🛠️ **Inference Flag Optimisation (`/fulcrum optimise`)**: Advises on chunked prefill, prefix caching, native FP8, tensor parallelism, and Pallas PagedAttention flags tailored to specific hardware architectures.
+- 🛠️ **Inference Flag Optimisation (`/fulcrum optimise`)**: Advises on chunked prefill, prefix caching, native FP8, tensor parallelism, Pallas PagedAttention, and Strata 3-tier MoE expert caching (`--evict lfu --kv int8 --spec 3`) tailored to specific hardware architectures.
 - 🧹 **Safe Teardown (`/fulcrum delete`)**: Deprovisions Vertex AI Endpoints, undeploys models, and removes Compute Engine VMs and firewall rules without leaving lingering cloud costs.
 
 ---
@@ -147,6 +146,9 @@ Calculates exact model parameter counts, weight memory footprints, and KV cache 
 
 # Discover models tailored for Cloud TPU hardware
 .venv/bin/python3 fulcrum/scripts/find_model.py --query qwen --accelerator tpu
+
+# Discover Mixture-of-Experts (MoE) models that fit on 1x 24GB L4 GPU via Strata 3-tier offloading
+.venv/bin/python3 fulcrum/scripts/find_model.py --engine strata --moe-only --vram-limit 24
 ```
 
 ### 2. `/fulcrum run` — GCP Deployment Orchestrator
@@ -197,16 +199,20 @@ Key automated capabilities:
     --gcs-model-path gs://your-bucket-us-central1/models/qwen14b \
     --dry-run
 
+# Provision a 125B MoE model on 1x L4 GPU + 128GB RAM + 375GB Local NVMe SSD using Strata
+.venv/bin/python3 fulcrum/scripts/launch_gcp.py \
+    --model Qwen/Qwen3.8-Flash-Next \
+    --engine strata \
+    --dry-run
+
 # Generate Terraform HCL infrastructure-as-code
 .venv/bin/python3 fulcrum/scripts/launch_gcp.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --format terraform
 ```
 
-### 3. `/fulcrum status` — Deployment Telemetry & Utilisation
 ### 3. `/fulcrum status` — Deployment Telemetry, Utilisation & Cloud Logging
 
-Monitors running endpoints and VMs, tests health routes (`/health`), and scrapes live vLLM Prometheus metrics:
 Monitors running endpoints and VMs, tests health routes (`/health`), scrapes live vLLM Prometheus metrics, and streams live container logs:
 
 ```bash
@@ -271,6 +277,13 @@ Formulates mathematically sound vLLM serving parameters for your target hardware
     --model Qwen/Qwen2.5-14B-Instruct \
     --gpu-type ct6e-standard-4t \
     --gpu-count 4
+
+# Strata MoE 3-tier expert streaming advice for 1x NVIDIA L4 + Host RAM + Local NVMe SSD
+.venv/bin/python3 fulcrum/scripts/optimise_deployment.py advise \
+    --model Qwen/Qwen3.8-Flash-Next \
+    --engine strata \
+    --gpu-type nvidia-l4 \
+    --workload latency
 ```
 
 ### 7. `/fulcrum delete` — Safe Teardown & Deprovisioning

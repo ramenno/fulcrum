@@ -227,3 +227,53 @@ Vertex AI exposes minimal startup feedback in the Google Cloud Console while a c
 # Inspect raw JSON log payloads for low-level debugging:
 .venv/bin/python3 fulcrum/scripts/status_deployment.py --id <resource-name> --logs --raw
 ```
+
+---
+
+## 11. Strata MoE Inference Engine & 3-Tier Dynamic Expert Streaming Runbook
+
+**Strata** (`stratallm.org`) is a specialised Mixture-of-Experts (MoE) inference runtime engineered to serve massive sparse MoE models (35B to 141B+ total parameters) on a **single 24 GB NVIDIA L4 GPU** on Compute Engine (`g2-standard-16` or `g2-standard-32`) by exploiting sparse router locality across a 3-tier memory hierarchy.
+
+### Why Standard vLLM Struggles with Large MoEs on Single-GPU Nodes
+In dense-style pre-loading, an MoE model like `Qwen/Qwen3.8-Flash-Next` (125B total parameters, 10B active per token) requires ~72 GiB even in 4-bit quantisation — necessitating 4x L4 GPUs (`g2-standard-48`) or 1x A100-80GB (`a2-ultragpu-1g`). Yet on any given token, 92% of the expert weights sit idle.
+
+### Strata's 3-Tier Memory Architecture on GCP
+1. **Tier 1: GPU VRAM (`--vram 22 --vram-reserve-mib 2048`)**
+   - Pins dense attention layers, router gates, shared experts, INT8 KV cache (`--kv int8`), and the hottest routed experts.
+2. **Tier 2: Host System RAM (`--ram 48` on `g2-standard-16` or `--ram 96` on `g2-standard-32`)**
+   - Caches warm MoE experts in pinned host memory. Strata uses layer-ahead router prediction to prefetch experts asynchronously over PCIe Gen4 (`--pcie-frac 0.85`).
+3. **Tier 3: Local NVMe SSD (`--local-ssd=interface=NVME` mounted at `/mnt/nvme`)**
+   - Stores the complete GSQ-RCO (Group-Symmetric Quantisation with Row-Column Outlier compensation) or GGUF checkpoint and serves cold tail experts with ~2.6 GB/s sequential read bandwidth.
+
+### Recommended `strata-cli serve` Flags by Workload
+
+| Flag | Balanced (Default) | Latency-Optimised | Throughput-Optimised | Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| `--vram` | `22` | `22` | `22` | Usable VRAM budget (GiB) on 24 GB NVIDIA L4 |
+| `--ram` | `48` / `96` | `48` / `96` | `48` / `96` | Host System RAM cache budget (`g2-standard-16` / `32`) |
+| `--vram-reserve-mib` | `2048` | `2048` | `2048` | CUDA context & async DMA transfer buffer reserve |
+| `--expert-cache` | `auto` | `auto` | `auto` | Dynamic GPU/RAM expert slot allocation |
+| `--evict` | `lfu` | `lfu` | `lfu` | Least-Frequently-Used eviction retains power-law hot experts |
+| `--kv` | `int8` | `int8` | `int8` | Halves KV cache footprint to maximise GPU expert slots |
+| `--prefill` | `auto` | `auto` | `auto` | Hybrid CPU/GPU batched expert execution during prefill |
+| `--spec` / `--mtp` | — | `--spec 3 --mtp auto` | — | Multi-Token Prediction amortises expert transfers across drafted tokens |
+| `--skip-w` | — | `--skip-w 0.02 --prompt-skip-w 0.03` | — | Skips negligible tail experts (<2% router weight) to cut PCIe latency |
+| `--pcie-frac` | — | — | `--pcie-frac 0.85` | Dedicates 85% PCIe Gen4 bandwidth to async prefetching |
+
+### Example Fulcrum Commands for Strata
+```bash
+# 1. Discover MoE models sized for Strata on a single 24GB L4 GPU
+.venv/bin/python3 fulcrum/scripts/find_model.py --engine strata --moe-only --vram-limit 24
+
+# 2. Generate optimised Strata flags for Qwen 3.8 Flash Next (125B MoE)
+.venv/bin/python3 fulcrum/scripts/optimise_deployment.py advise \
+    --model Qwen/Qwen3.8-Flash-Next \
+    --engine strata \
+    --workload latency
+
+# 3. Provision a GCE g2-standard-32 instance with 1x L4 + 128GB RAM + 375GB Local NVMe SSD
+.venv/bin/python3 fulcrum/scripts/launch_gcp.py \
+    --model Qwen/Qwen3.8-Flash-Next \
+    --engine strata \
+    --dry-run
+```

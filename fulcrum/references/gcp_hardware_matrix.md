@@ -55,13 +55,16 @@ Google Cloud enforces strict 1:1 hardware topologies for G2 instances. Using an 
 
 ---
 
-## Compute Engine (GCE) Machine Configurations (Fallback)
+## Compute Engine (GCE) Machine Configurations (Fallback & Strata 3-Tier MoE)
 
-When Vertex AI Endpoints are not viable or explicitly overridden, GCE instances provide raw host control:
-- G2 Series: `g2-standard-4`, `g2-standard-8`, `g2-standard-16`, `g2-standard-32`, `g2-standard-96`
-- A2 Series: `a2-highgpu-1g` to `8g`, `a2-ultragpu-1g` to `8g`
-- A3 Series: `a3-highgpu-8g`
-- GCE instances use deeplearning Debian images with standalone Docker containers running `vllm/vllm-openai:latest` and expose port 8000 via VPC firewall rules.
+When Vertex AI Endpoints are not viable, explicitly overridden, or when deploying **Strata MoE (`--engine strata`)** with 3-tier dynamic expert streaming:
+- **G2 Series for Standard vLLM**: `g2-standard-8` (1x L4, 32 GB RAM), `g2-standard-24` (2x L4, 96 GB RAM), `g2-standard-48` (4x L4, 192 GB RAM), `g2-standard-96` (8x L4, 384 GB RAM).
+- **G2 Series for Strata 3-Tier MoE (`--engine strata`)**:
+  - `g2-standard-16`: 1x `nvidia-l4` (24 GB VRAM) + 16 vCPUs + **64 GB System RAM** + 1x 375 GB Local NVMe SSD (`--local-ssd=interface=NVME`) — *Recommended for 16B–35B MoE models (e.g. `Qwen/Qwen3.6-35B-A3B`, `deepseek-ai/DeepSeek-V2-Lite-Chat`)*.
+  - `g2-standard-32`: 1x `nvidia-l4` (24 GB VRAM) + 32 vCPUs + **128 GB System RAM** + 1x 375 GB Local NVMe SSD (`--local-ssd=interface=NVME`) — *Recommended for 70B–141B MoE models (e.g. `Qwen/Qwen3.8-Flash-Next` 125B, `mistralai/Mixtral-8x22B-Instruct-v0.1` 141B)*.
+- **A2 Series**: `a2-highgpu-1g` to `8g`, `a2-ultragpu-1g` to `8g`
+- **A3 Series**: `a3-highgpu-8g`
+- GCE instances use Deep Learning VM Debian images running either `vllm/vllm-openai:latest` (Docker) or `strata-cli serve` (with `/dev/nvme0n1` mounted at `/mnt/nvme`) and expose port 8000 via VPC firewall rules.
 
 ---
 

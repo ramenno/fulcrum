@@ -485,6 +485,80 @@ MODELS_CATALOGUE: List[ModelMetadata] = [
         supports_fp8=True,
         gated=False,
     ),
+
+    # Mixture-of-Experts (MoE) series (Strata & vLLM compatible)
+    ModelMetadata(
+        id="deepseek-ai/DeepSeek-V2-Lite-Chat",
+        name="DeepSeek V2 Lite 16B MoE",
+        organisation="DeepSeek",
+        parameters_billion=15.7,
+        active_parameters_billion=2.4,
+        default_context=8192,
+        max_context=32768,
+        architecture="deepseek_v2",
+        num_layers=27,
+        num_kv_heads=8,
+        head_dim=128,
+        license="MIT",
+        primary_tasks=["general", "coding", "reasoning"],
+        strengths="Compact Multi-head Latent Attention (MLA) + DeepSeekMoE (15.7B total, 2.4B active) with ultra-low KV cache footprint.",
+        supports_fp8=True,
+        gated=False,
+    ),
+    ModelMetadata(
+        id="Qwen/Qwen3.6-35B-A3B",
+        name="Qwen 3.6 35B-A3B MoE",
+        organisation="Alibaba Cloud",
+        parameters_billion=35.0,
+        active_parameters_billion=3.0,
+        default_context=8192,
+        max_context=131072,
+        architecture="qwen3_moe",
+        num_layers=48,
+        num_kv_heads=4,
+        head_dim=128,
+        license="Apache-2.0",
+        primary_tasks=["general", "coding", "reasoning", "agentic", "multilingual"],
+        strengths="Fine-grained Mixture-of-Experts (35B total, 3B active); runs on a single 24GB L4 via Strata MoE offloading or 4x L4 in vLLM.",
+        supports_fp8=True,
+        gated=False,
+    ),
+    ModelMetadata(
+        id="Qwen/Qwen3.8-Flash-Next",
+        name="Qwen 3.8 Flash Next 125B MoE",
+        organisation="Alibaba Cloud",
+        parameters_billion=125.0,
+        active_parameters_billion=10.0,
+        default_context=8192,
+        max_context=131072,
+        architecture="qwen3_moe",
+        num_layers=64,
+        num_kv_heads=8,
+        head_dim=128,
+        license="Apache-2.0",
+        primary_tasks=["general", "reasoning", "coding", "agentic", "math"],
+        strengths="Frontier 125B Mixture-of-Experts (~10B active); deployable on a single 24GB L4 + 128GB RAM + NVMe via Strata dynamic expert streaming.",
+        supports_fp8=True,
+        gated=False,
+    ),
+    ModelMetadata(
+        id="mistralai/Mixtral-8x22B-Instruct-v0.1",
+        name="Mixtral 8x22B Instruct MoE",
+        organisation="Mistral AI",
+        parameters_billion=141.0,
+        active_parameters_billion=39.0,
+        default_context=8192,
+        max_context=65536,
+        architecture="mixtral",
+        num_layers=56,
+        num_kv_heads=8,
+        head_dim=128,
+        license="Apache-2.0",
+        primary_tasks=["general", "coding", "reasoning", "multilingual", "math"],
+        strengths="Sparse 8-expert 141B MoE (39B active); supports Strata hierarchical GPU/RAM/NVMe expert streaming or multi-GPU vLLM.",
+        supports_fp8=True,
+        gated=False,
+    ),
 ]
 
 
@@ -610,15 +684,70 @@ def calculate_memory_and_hardware(
         " --enable-prefix-caching"
     )
 
+    # Strata MoE Dynamic Sparse Router Offloading sizing (stratallm.org)
+    # Three-tier memory hierarchy:
+    # 1. GPU VRAM: Active parameters + shared attention + router gates + hot expert cache + INT8 KV cache
+    # 2. Host System RAM: Dormant MoE expert weights swapped over PCIe
+    # 3. Local NVMe SSD: Zero-copy mmap GSQ-RCO / GGUF shard storage
+    is_moe = model.active_parameters_billion < model.parameters_billion
+    strata_active_vram_gb = (model.active_parameters_billion * 1e9 * 0.55) / (1024**3) * 1.05
+    strata_kv_int8_gb = kv_cache_vram_gb * 0.5
+    strata_hot_expert_cache_gb = 6.0 if is_moe else 2.0
+    strata_vram_needed_gb = round(min(22.0, strata_active_vram_gb + strata_kv_int8_gb + strata_hot_expert_cache_gb + 2.0), 2)
+
+    dormant_params_b = max(0.0, model.parameters_billion - model.active_parameters_billion)
+    strata_ram_needed_gb = round((dormant_params_b * 1e9 * 0.55) / (1024**3) * 1.10, 2) if is_moe else round(weights_vram_gb * 0.35, 2)
+
+    if strata_ram_needed_gb <= 48.0:
+        strata_machine = "g2-standard-16"
+        strata_host_ram_gb = 64
+        strata_ram_flag = 48
+        strata_cost = "~$1.05/hr"
+    else:
+        strata_machine = "g2-standard-32"
+        strata_host_ram_gb = 128
+        strata_ram_flag = 96
+        strata_cost = "~$1.65/hr"
+
+    selected_strata = {
+        "engine": "strata",
+        "is_moe": is_moe,
+        "gpu": "nvidia-l4",
+        "count": 1,
+        "vram": 24,
+        "vram_needed_gb": strata_vram_needed_gb,
+        "ram_needed_gb": strata_ram_needed_gb,
+        "host_ram_gb": strata_host_ram_gb,
+        "local_nvme_gb": 375,
+        "machine": strata_machine,
+        "cost_hr": strata_cost,
+    }
+
+    strata_cmd = (
+        f"strata-cli serve --model {model.id}"
+        f" --vram 22"
+        f" --ram {strata_ram_flag}"
+        f" --vram-reserve-mib 2048"
+        f" --expert-cache auto"
+        f" --evict lfu"
+        f" --kv int8"
+        f" --prefill auto"
+        f" --max-context {min(model.max_context, context_tokens)}"
+        f" --port 8000"
+    )
+
     return {
         "precision": precision,
+        "is_moe": is_moe,
         "weights_vram_gb": round(weights_vram_gb, 2),
         "kv_cache_vram_gb": round(kv_cache_vram_gb, 2),
         "activation_headroom_gb": round(activation_headroom_gb, 2),
         "total_vram_needed_gb": round(total_vram_needed_gb, 2),
         "recommended_gcp": selected_gcp,
         "recommended_tpu": selected_tpu,
+        "recommended_strata": selected_strata,
         "vllm_command": vllm_cmd,
+        "strata_command": strata_cmd,
     }
 
 
@@ -630,15 +759,25 @@ def search_models(
     license_type: Optional[str] = None,
     query: Optional[str] = None,
     context_window: int = 8192,
+    engine: str = "all",
+    moe_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Filters the catalogue according to user requirements."""
     results = []
 
     for model in MODELS_CATALOGUE:
+        if moe_only and model.active_parameters_billion >= model.parameters_billion:
+            continue
+
         # Filter by search query
         if query:
             q = query.lower()
-            match_name = q in model.name.lower() or q in model.id.lower() or q in model.strengths.lower()
+            match_name = (
+                q in model.name.lower()
+                or q in model.id.lower()
+                or q in model.strengths.lower()
+                or q in model.architecture.lower()
+            )
             if not match_name:
                 continue
 
@@ -670,9 +809,14 @@ def search_models(
             batch_size=8,
         )
 
-        # Filter by VRAM limit
-        if vram_limit_gb and calc["total_vram_needed_gb"] > vram_limit_gb:
-            continue
+        # Filter by VRAM limit (respecting Strata 3-tier MoE offloading when engine=='strata')
+        if vram_limit_gb:
+            if engine.lower() == "strata":
+                if calc["recommended_strata"]["vram_needed_gb"] > vram_limit_gb:
+                    continue
+            else:
+                if calc["total_vram_needed_gb"] > vram_limit_gb:
+                    continue
 
         item = {
             "metadata": asdict(model),
@@ -685,13 +829,15 @@ def search_models(
     return results
 
 
-def format_table(results: List[Dict[str, Any]], accelerator: str = "all") -> str:
+def format_table(results: List[Dict[str, Any]], accelerator: str = "all", engine: str = "all") -> str:
     """Formats model recommendations into a clear ASCII table."""
     if not results:
         return "No open-weight models found matching the specified criteria."
 
     lines = []
-    if accelerator == "tpu":
+    if engine == "strata":
+        header = f"{'MODEL ID':<36} | {'TOTAL/ACT':<10} | {'VRAM/RAM':<13} | {'STRATA GCE NODE (NVMe)':<24} | {'EST COST':<10}"
+    elif accelerator == "tpu":
         header = f"{'MODEL ID':<36} | {'PARAMS':<7} | {'MEM (GB)':<8} | {'RECOMMENDED CLOUD TPU':<25} | {'EST COST':<10}"
     elif accelerator == "gpu":
         header = f"{'MODEL ID':<36} | {'PARAMS':<7} | {'MEM (GB)':<8} | {'RECOMMENDED GCP GPU':<26} | {'EST COST':<10}"
@@ -708,13 +854,19 @@ def format_table(results: List[Dict[str, Any]], accelerator: str = "all") -> str
         h = item["hardware_calc"]
         g = h["recommended_gcp"]
         t = h.get("recommended_tpu", {})
+        s = h.get("recommended_strata", {})
         gpu_str = f"{g['count']}x {g['gpu'].replace('nvidia-', '')} ({g['machine']})"
         tpu_str = f"{t.get('chips', 1)}x {t.get('generation', 'v5e')} ({t.get('machine', 'n/a')})"
         params_str = f"{m['parameters_billion']}B"
         vram_str = f"{h['total_vram_needed_gb']} GB"
         license_str = m["license"][:12]
         
-        if accelerator == "tpu":
+        if engine == "strata":
+            p_act = f"{m['parameters_billion']}B/{m['active_parameters_billion']}B"
+            vram_ram = f"{s.get('vram_needed_gb', 22)}G/{s.get('ram_needed_gb', 0)}G"
+            strata_node = f"1x l4 ({s.get('machine', 'g2-standard-16')})"
+            lines.append(f"{m['id']:<36} | {p_act:<10} | {vram_ram:<13} | {strata_node:<24} | {s.get('cost_hr', '~$1.05/hr'):<10}")
+        elif accelerator == "tpu":
             lines.append(f"{m['id']:<36} | {params_str:<7} | {vram_str:<8} | {tpu_str:<25} | {t.get('cost_hr', 'n/a'):<10}")
         elif accelerator == "gpu":
             lines.append(f"{m['id']:<36} | {params_str:<7} | {vram_str:<8} | {gpu_str:<26} | {g['cost_hr']:<10}")
@@ -1048,6 +1200,17 @@ Examples:
         default="all",
         help="Accelerator architecture to display in recommendations (all, gpu, or tpu)",
     )
+    parser.add_argument(
+        "--engine",
+        choices=["all", "vllm", "strata"],
+        default="all",
+        help="Inference engine mode: all, vllm, or strata (MoE CPU/GPU/NVMe expert streaming)",
+    )
+    parser.add_argument(
+        "--moe-only",
+        action="store_true",
+        help="Filter catalogue to Mixture-of-Experts (MoE) architectures only",
+    )
     parser.add_argument("--max-params", "-p", type=float, help="Maximum parameter count in billions (e.g. 14, 32, 70)")
     parser.add_argument("--vram-limit", "-v", type=float, help="Maximum available GPU VRAM in GB (e.g. 24, 48, 80)")
     parser.add_argument(
@@ -1085,12 +1248,14 @@ Examples:
         license_type=args.license if args.license != "all" else None,
         query=args.query,
         context_window=args.context_window,
+        engine=args.engine,
+        moe_only=args.moe_only,
     )
 
     if args.format == "json":
         print(json.dumps(results, indent=2))
     else:
-        print(format_table(results, accelerator=args.accelerator))
+        print(format_table(results, accelerator=args.accelerator, engine=args.engine))
         if results:
             print("\nTop Recommendation Details:")
             top = results[0]
@@ -1098,14 +1263,24 @@ Examples:
             h = top["hardware_calc"]
             g = h["recommended_gcp"]
             t = h.get("recommended_tpu", {})
+            s = h.get("recommended_strata", {})
             print(f"  Model:             {m['name']} ({m['id']})")
+            if h.get("is_moe"):
+                print(f"  Architecture:      Mixture-of-Experts ({m['parameters_billion']}B total / {m['active_parameters_billion']}B active per token)")
             print(f"  Strengths:         {m['strengths']}")
             print(f"  GCP GPU Machine:   {g['machine']} ({g['count']}x {g['gpu']}, {g['vram']} GB VRAM total) - {g['cost_hr']}")
             if t:
                 print(f"  Cloud TPU Machine: {t.get('machine')} ({t.get('chips')}x {t.get('tpu')}, {t.get('hbm')} GB HBM total) - {t.get('cost_hr')}")
+            if s and (args.engine == "strata" or h.get("is_moe")):
+                print(
+                    f"  Strata MoE Node:   {s['machine']} (1x {s['gpu']} 24GB VRAM + {s['host_ram_gb']}GB System RAM + {s['local_nvme_gb']}GB Local NVMe SSD) - {s['cost_hr']}"
+                )
             print(f"  Memory Split:      Weights: {h['weights_vram_gb']}GB | KV Cache: {h['kv_cache_vram_gb']}GB | Headroom: {h['activation_headroom_gb']}GB")
             print(f"  vLLM Run Command:")
             print(f"    {h['vllm_command']}")
+            if h.get("strata_command") and (args.engine == "strata" or h.get("is_moe")):
+                print(f"  Strata Run Command (MoE CPU/GPU/NVMe Offload):")
+                print(f"    {h['strata_command']}")
 
 
 if __name__ == "__main__":
