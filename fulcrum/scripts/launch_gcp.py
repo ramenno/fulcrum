@@ -426,9 +426,10 @@ def dispatch_vertex_deploy_model_async(
         machine_spec["acceleratorType"] = vertex_accel.upper().replace("-", "_")
         machine_spec["acceleratorCount"] = int(gpu_count)
 
+    full_model_name = model_id if str(model_id).startswith("projects/") else f"projects/{project}/locations/{region}/models/{model_id}"
     payload = {
         "deployedModel": {
-            "model": f"projects/{project}/locations/{region}/models/{model_id}",
+            "model": full_model_name,
             "displayName": display_name,
             "dedicatedResources": {
                 "machineSpec": machine_spec,
@@ -601,6 +602,8 @@ def generate_vertex_commands(
             f"--max-model-len={max_model_len},"
             f"--gpu-memory-utilization={gpu_memory_utilization:.2f},"
             f"--block-size=16,"
+            f"--no-enable-prefix-caching,"
+            f"--disable-chunked-mm-input,"
             f"--trust-remote-code"
             f"{quant_flag}"
         )
@@ -1515,6 +1518,8 @@ Examples:
                     f"--max-model-len={effective_max_model_len},"
                     f"--gpu-memory-utilization={effective_gpu_memory_utilization:.2f},"
                     f"--block-size=16,"
+                    f"--no-enable-prefix-caching,"
+                    f"--disable-chunked-mm-input,"
                     f"--trust-remote-code"
                     f"{quant_flag}"
                 )
@@ -1545,9 +1550,10 @@ Examples:
                 )
 
             print("Step 2: Checking / Uploading model to Vertex Model Registry...")
+            model_display_name = f"{resource_name}-model-{effective_max_model_len}"
             query_model = subprocess.run(
                 ["gcloud", "ai", "models", "list", f"--project={project}", f"--region={region}",
-                 f"--filter=displayName={resource_name}-model", "--format=value(name.basename())",
+                 f"--filter=displayName={model_display_name}", "--format=value(name.basename())",
                  "--sort-by=~createTime", "--limit=1"],
                 capture_output=True, text=True, check=False
             )
@@ -1559,7 +1565,7 @@ Examples:
             else:
                 upload_cmd = (
                     f'gcloud ai models upload --project={project} --region={region} '
-                    f'--display-name={resource_name}-model '
+                    f'--display-name={model_display_name} '
                     f'--container-image-uri="{container_image}" '
                     f'--container-command="python3,-m,vllm.entrypoints.openai.api_server" '
                     f'--container-ports=8080 '
@@ -1579,11 +1585,11 @@ Examples:
                 if not model_id:
                     q_m = subprocess.run(
                         ["gcloud", "ai", "models", "list", f"--project={project}", f"--region={region}",
-                         f"--filter=displayName={resource_name}-model", "--format=value(name.basename())",
+                         f"--filter=displayName={model_display_name}", "--format=value(name.basename())",
                          "--sort-by=~createTime", "--limit=1"],
                         capture_output=True, text=True, check=False
                     )
-                    model_id = q_m.stdout.strip().splitlines()[-1] if q_m.stdout.strip() else f"{resource_name}-model"
+                    model_id = q_m.stdout.strip().splitlines()[-1] if q_m.stdout.strip() else model_display_name
                 print(f"Uploaded Model ID: {model_id}")
             record_data["vertex_model_id"] = model_id
 
