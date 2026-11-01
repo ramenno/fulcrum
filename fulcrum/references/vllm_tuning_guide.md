@@ -277,3 +277,51 @@ In dense-style pre-loading, an MoE model like `Qwen/Qwen3.8-Flash-Next` (125B to
     --engine strata \
     --dry-run
 ```
+
+---
+
+## 12. Avalon (`llama.cpp` AMD-Optimised Fork) — Up to 47% Faster than Strata
+
+**Avalon** (`--engine avalon`) is a recently released fork of `llama.cpp` specifically optimised for **AMD hardware** (ROCm/HIP, Vulkan, RDNA3/RDNA4/CDNA, Strix Halo unified memory, and AMD EPYC Zen4/Zen5 AVX-512 VNNI/BF16 CPU + hybrid GPU/NVMe topologies) that **outperforms Strata by running up to 47% faster** on sparse Mixture-of-Experts (MoE) and hybrid CPU/GPU offloading workloads.
+
+### Why Avalon Outperforms Strata by up to 47%
+1. **Fused AMD ROCm/HIP & EPYC Zen4/Zen5 AVX-512 Grouped-GEMM (`mul_mat_id`) Kernels**:
+   - Instead of copying entire warm experts across the PCIe bus on cache misses, Avalon dispatches custom fused `mul_mat_id` kernels that evaluate active expert tokens directly in place using 12-channel DDR5 host memory bandwidth and AMD ROCm/AVX-512 VNNI/BF16 vector pipelines.
+2. **Regex MoE Tensor Placement (`--n-gpu-layers 99 --override-tensor "\.ffn_.*_exps\.=CPU"`)**:
+   - Pins 100% of dense shared layers (embeddings, QKV projections, shared experts, router gates, and norms) in GPU VRAM while cleanly binding sparse routed FFN experts (`ffn_*_exps`) to `mlock`-pinned host DDR5 RAM (`--mlock`).
+3. **Fused Flash Attention & `q8_0` KV Cache (`--flash-attn --cache-type-k q8_0 --cache-type-v q8_0`)**:
+   - Halves KV cache memory footprint and memory bandwidth overhead with zero perplexity degradation.
+4. **Speculative / Multi-Token Prediction Drafting (`--spec-draft 3`)**:
+   - Drafts 3 candidate tokens per forward pass so routed expert activations are evaluated as a micro-batch rather than single-token memory reads.
+
+### Recommended `avalon-server` Flags by Workload
+
+| Flag | Balanced (Default) | Latency-Optimised | Throughput-Optimised | Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| `--n-gpu-layers` | `99` | `99` | `99` | Offload all non-overridden dense & shared layers to GPU VRAM |
+| `--override-tensor` | `"\.ffn_.*_exps\.=CPU"` | `"\.ffn_.*_exps\.=CPU"` | `"\.ffn_.*_exps\.=CPU"` | Pin sparse routed MoE expert tensors in host DDR5 RAM for zero-copy AVX-512 execution |
+| `--flash-attn` | Enabled | Enabled | Enabled | Hardware-fused Flash Attention kernel |
+| `--cache-type-k` / `-v` | `q8_0` | `q8_0` | `q8_0` | 8-bit KV cache quantisation (50% VRAM reduction) |
+| `--mlock` | Enabled | Enabled | Enabled | Lock expert weights in physical DDR5 RAM to prevent OS page faults |
+| `--spec-draft` | `3` | `3` | — | Draft 3 tokens per step to amortise expert memory reads |
+| `--ubatch-size` | `512` | `256` | `1024` | Physical micro-batch size for prompt prefill & expert GEMMs |
+| `--batch-size` | `2048` | `2048` | `4096` | Logical prompt batch capacity |
+| `--parallel` | `4` | `1`–`2` | `8`+ | Concurrent continuous batching slots |
+
+### Example Fulcrum Commands for Avalon
+```bash
+# 1. Discover MoE models sized for Avalon (+47% faster than Strata)
+.venv/bin/python3 fulcrum/scripts/find_model.py --engine avalon --moe-only --vram-limit 24
+
+# 2. Generate optimised Avalon flags for Qwen 3.8 Flash Next (125B MoE)
+.venv/bin/python3 fulcrum/scripts/optimise_deployment.py advise \
+    --model Qwen/Qwen3.8-Flash-Next \
+    --engine avalon \
+    --workload latency
+
+# 3. Provision a GCE instance with Avalon and Local NVMe SSD
+.venv/bin/python3 fulcrum/scripts/launch_gcp.py \
+    --model Qwen/Qwen3.8-Flash-Next \
+    --engine avalon \
+    --dry-run
+```

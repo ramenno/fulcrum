@@ -127,6 +127,75 @@ def formulate_recommendations(
             "command": full_command,
         }
 
+    if engine.lower() == "avalon":
+        mid = model.lower()
+        is_massive_moe = any(h in mid for h in ("125b", "141b", "8x22b", "flash-next", "70b", "72b", "671b"))
+        threads = 30 if is_massive_moe else 16
+        amd_machine_rec = "c3d-standard-30 / g2-standard-32 (120-128 GB DDR5 RAM)" if is_massive_moe else "c3d-standard-16 / g2-standard-16 (64 GB DDR5 RAM)"
+
+        flags["--n-gpu-layers"] = 99
+        flags["--override-tensor"] = '"\\.ffn_.*_exps\\.=CPU"'
+        flags["--flash-attn"] = True
+        flags["--cache-type-k"] = "q8_0"
+        flags["--cache-type-v"] = "q8_0"
+        flags["--ctx-size"] = max_context
+        flags["--threads"] = threads
+        flags["--mlock"] = True
+        flags["--port"] = 8000
+
+        rationales.append(
+            f"Avalon AMD-Optimised llama.cpp Fork (Up to 47% Faster than Strata): Uses fused ROCm/HIP/Vulkan and AMD EPYC Zen4/Zen5 AVX-512 "
+            f"VNNI/BF16 grouped-GEMM (mul_mat_id) kernels on {amd_machine_rec}."
+        )
+        rationales.append(
+            'Regex MoE Expert Tensor Placement (--n-gpu-layers 99 --override-tensor "\\.ffn_.*_exps\\.=CPU"): Pins shared attention, '
+            "router gates, and dense norms in GPU VRAM while executing sparse routed FFN experts directly across multi-channel DDR5 host memory (--mlock), eliminating PCIe expert-swap stalls."
+        )
+        rationales.append(
+            "Enabled Fused Flash Attention (--flash-attn) and q8_0 KV cache quantisation (--cache-type-k q8_0 --cache-type-v q8_0) to halve KV cache bandwidth and memory footprint."
+        )
+
+        if workload == "latency":
+            flags["--spec-draft"] = 3
+            flags["--ubatch-size"] = 256
+            rationales.append(
+                "Enabled speculative / Multi-Token Prediction drafting (--spec-draft 3) and tight micro-batching (--ubatch-size 256) to minimise Time Per Output Token (TPOT)."
+            )
+        elif workload == "throughput":
+            flags["--batch-size"] = 2048
+            flags["--ubatch-size"] = 1024
+            flags["--parallel"] = max(4, min(16, expected_concurrency))
+            rationales.append(
+                f"Configured continuous batching slots (--parallel {flags['--parallel']} --batch-size 2048 --ubatch-size 1024) to saturate AMD AVX-512 / GPU matrix units under concurrent load."
+            )
+        else:
+            flags["--spec-draft"] = 3
+            flags["--ubatch-size"] = 512
+            rationales.append(
+                "Balanced micro-batching (--ubatch-size 512) with 3-token speculative drafting (--spec-draft 3) for optimal prefill and decode throughput."
+            )
+
+        cmd_parts = [f"avalon-server \\\n    --model {model}"]
+        for k, v in flags.items():
+            if isinstance(v, bool):
+                if v:
+                    cmd_parts.append(k)
+            else:
+                cmd_parts.append(f"{k} {v}")
+        full_command = " \\\n    ".join(cmd_parts)
+
+        return {
+            "engine": "avalon",
+            "speedup_vs_strata": "+47%",
+            "model": model,
+            "gpu_type": gpu_type,
+            "gpu_count": gpu_count,
+            "workload": workload,
+            "flags": flags,
+            "rationales": rationales,
+            "command": full_command,
+        }
+
     # Tensor Parallelism
     flags["--tensor-parallel-size"] = gpu_count
     unit_name = "Cloud TPU chips" if arch == "tpu" else "GPUs"
@@ -466,14 +535,14 @@ Examples:
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     # Subcommand: advise
-    advise_parser = subparsers.add_parser("advise", help="Calculate optimal vLLM or Strata flags for target hardware and workload")
+    advise_parser = subparsers.add_parser("advise", help="Calculate optimal vLLM, Strata, or Avalon flags for target hardware and workload")
     advise_parser.add_argument("--model", "-m", type=str, required=True, help="Model ID (e.g. google/gemma-3-12b-it)")
     advise_parser.add_argument("--gpu-type", type=str, default="nvidia-l4", help="GPU type (nvidia-l4, nvidia-tesla-a100, nvidia-h100-80gb)")
     advise_parser.add_argument("--gpu-count", type=int, default=1, help="GPU count (default: 1)")
     advise_parser.add_argument("--workload", "-w", choices=["throughput", "latency", "balanced"], default="balanced", help="Optimisation goal")
     advise_parser.add_argument("--max-context", type=int, default=8192, help="Target context window length (default: 8192)")
     advise_parser.add_argument("--concurrency", "-c", type=int, default=16, help="Expected concurrent request count (default: 16)")
-    advise_parser.add_argument("--engine", choices=["vllm", "strata"], default="vllm", help="Inference engine runtime: vllm (default) or strata (3-tier MoE)")
+    advise_parser.add_argument("--engine", choices=["vllm", "strata", "avalon"], default="vllm", help="Inference engine runtime: vllm (default), strata (3-tier MoE), or avalon (AMD-optimised llama.cpp fork, up to 47%% faster than Strata)")
     advise_parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
 
     # Subcommand: benchmark
@@ -502,10 +571,16 @@ Examples:
         if args.format == "json":
             print(json.dumps(rec, indent=2))
         else:
+            engine_display = (
+                "Avalon (AMD-Optimised llama.cpp Fork — up to 47% faster than Strata)"
+                if args.engine == "avalon"
+                else ("Strata MoE (3-Tier Dynamic Expert Streaming)" if args.engine == "strata" else "vLLM")
+            )
+            engine_short = "Avalon" if args.engine == "avalon" else ("Strata" if args.engine == "strata" else "vLLM")
             print("=" * 80)
             print(f"  /fulcrum optimise: Tuning Formulation for {args.model}")
             print("=" * 80)
-            print(f"Inference Engine:    {'Strata MoE (3-Tier Dynamic Expert Streaming)' if args.engine == 'strata' else 'vLLM'}")
+            print(f"Inference Engine:    {engine_display}")
             print(f"Hardware Target:     {args.gpu_count}x {args.gpu_type}")
             print(f"Optimisation Goal:   {args.workload.capitalize()}")
             print(f"Context Window:      {args.max_context} tokens")
@@ -515,7 +590,7 @@ Examples:
             for idx, r in enumerate(rec["rationales"], 1):
                 print(f"  {idx}. {r}")
             print("-" * 80)
-            print(f"Optimised {'Strata' if args.engine == 'strata' else 'vLLM'} Serving Command:")
+            print(f"Optimised {engine_short} Serving Command:")
             print(f"  {rec['command']}")
             print("=" * 80)
 

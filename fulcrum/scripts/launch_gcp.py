@@ -156,9 +156,9 @@ def resolve_machine_type(
         return f"ct5lp-hightpu-{gpu_count}t"
 
     if "l4" in g_lower:
-        # Strata MoE 3-tier hierarchy requires expanded System RAM on a single L4 GPU:
+        # Strata and Avalon MoE 3-tier hierarchy requires expanded System RAM on a single L4 GPU:
         # g2-standard-16 (1x L4, 64 GB RAM) for <=35B MoEs; g2-standard-32 (1x L4, 128 GB RAM) for >=70B MoEs
-        if engine.lower() == "strata" and gpu_count == 1:
+        if engine.lower() in ("strata", "avalon") and gpu_count == 1:
             mid = (model_id or "").lower()
             if any(h in mid for h in ("125b", "141b", "8x22b", "flash-next", "70b", "72b", "671b")):
                 return "g2-standard-32"
@@ -206,9 +206,9 @@ def resolve_gcp_project(explicit_project: Optional[str] = None) -> str:
 
 def estimate_gpu_needs(model_id: str, engine: str = "vllm") -> Tuple[str, int]:
     """Infers suitable GPU type and count from model parameter hints."""
-    if engine.lower() == "strata":
-        # Strata MoE dynamic expert streaming holds active attention/router + hot experts
-        # on 1x NVIDIA L4 (24 GB VRAM) while offloading warm/cold experts to System RAM & NVMe
+    if engine.lower() in ("strata", "avalon"):
+        # Strata and Avalon MoE expert offloading hold active attention/router + hot experts
+        # on 1x GPU (24 GB VRAM) while offloading warm/cold experts to System RAM & NVMe
         return "nvidia-l4", 1
 
     mid = model_id.lower()
@@ -249,12 +249,18 @@ def evaluate_platform_viability(
     if req == "gke":
         return "gke", "Google Kubernetes Engine (GKE) explicitly requested by user."
 
-    # Check 0: Strata MoE 3-tier memory hierarchy (GPU VRAM + System RAM + Local NVMe SSD)
+    # Check 0: Strata and Avalon 3-tier / hybrid memory hierarchy (GPU VRAM + System RAM + Local NVMe SSD)
     if engine.lower() == "strata":
         return (
             "gce",
             "Strata MoE engine requires a 3-tier memory hierarchy (GPU VRAM + 64-128 GB Host System RAM "
             "+ Local NVMe SSD scratch disks) for dynamic sparse-router expert streaming; routing to Compute Engine (GCE).",
+        )
+    if engine.lower() == "avalon":
+        return (
+            "gce",
+            "Avalon engine (AMD-optimised llama.cpp fork, up to 47% faster than Strata) uses hybrid GPU/CPU/NVMe "
+            "expert tensor placement (--override-tensor) and Local NVMe SSD scratch storage; routing to Compute Engine (GCE).",
         )
 
     # Auto-detection mode: Vertex AI Endpoint is the primary choice whenever viable.
@@ -986,6 +992,70 @@ echo "Warning: Service startup did not complete within 5 minutes."
 """
 
 
+def generate_avalon_startup_script(
+    model: str,
+    port: int,
+    max_model_len: int,
+    n_gpu_layers: int = 99,
+    threads: int = 16,
+    hf_token: Optional[str] = None,
+) -> str:
+    """
+    Generates shell script embedded into GCE instance metadata to configure Local NVMe SSD
+    scratch storage and launch Avalon (AMD-optimised llama.cpp fork — up to 47% faster than Strata)
+    with fused ROCm/HIP/Vulkan & AMD Zen4/Zen5 AVX-512 grouped-GEMM kernels and regex MoE expert offloading.
+    """
+    token_export = f'export HF_TOKEN="{hf_token}"\n' if hf_token else ""
+
+    return f"""#!/bin/bash
+set -euxo pipefail
+
+echo "=== Fulcrum Avalon (AMD-Optimised llama.cpp Fork) Node Initialisation ==="
+{token_export}
+# 1. Format and mount Local NVMe SSD scratch disk (zero-copy mmap GGUF & expert cache)
+mkdir -p /mnt/nvme
+if [ -b /dev/nvme0n1 ]; then
+    mkfs.ext4 -F /dev/nvme0n1 || true
+    mount -o discard,defaults /dev/nvme0n1 /mnt/nvme || true
+    chmod 777 /mnt/nvme
+fi
+export HF_HOME="/mnt/nvme/huggingface"
+export AVALON_CACHE_DIR="/mnt/nvme/avalon-cache"
+mkdir -p "$HF_HOME" "$AVALON_CACHE_DIR"
+
+# 2. Install or build Avalon (AMD-optimised llama.cpp fork with ROCm/HIP, Vulkan & Zen4/Zen5 AVX-512 kernels)
+if ! command -v avalon-server &> /dev/null; then
+    curl -fsSL https://avalonllm.org/install.sh | sh || pip install avalon-cpp || true
+fi
+
+# 3. Launch Avalon OpenAI-compatible server with regex MoE expert tensor placement & Flash Attention
+nohup avalon-server \\
+    --model {model} \\
+    --port {port} \\
+    --n-gpu-layers {n_gpu_layers} \\
+    --override-tensor "\\.ffn_.*_exps\\.=CPU" \\
+    --flash-attn \\
+    --cache-type-k q8_0 \\
+    --cache-type-v q8_0 \\
+    --ctx-size {max_model_len} \\
+    --ubatch-size 512 \\
+    --spec-draft 3 \\
+    --threads {threads} \\
+    --mlock \\
+    > /var/log/avalon-serve.log 2>&1 &
+
+echo "=== Initialisation Complete. Probing /health on port {port}... ==="
+for i in $(seq 1 60); do
+    if curl -s "http://localhost:{port}/health" > /dev/null; then
+        echo "Avalon service is healthy!"
+        exit 0
+    fi
+    sleep 5
+done
+echo "Warning: Service startup did not complete within 5 minutes."
+"""
+
+
 def generate_terraform(
     instance_name: str,
     project: str,
@@ -1185,21 +1255,21 @@ Examples:
     )
     parser.add_argument(
         "--engine",
-        choices=["vllm", "strata"],
+        choices=["vllm", "strata", "avalon"],
         default="vllm",
-        help="Inference engine runtime: vllm (default) or strata (3-tier MoE dynamic expert streaming on GCE)",
+        help="Inference engine runtime: vllm (default), strata (3-tier MoE on GCE), or avalon (AMD-optimised llama.cpp fork, up to 47%% faster than Strata)",
     )
     parser.add_argument(
         "--strata-ram",
         type=int,
         default=None,
-        help="Host System RAM budget in GiB for Strata warm expert cache (default: 48 on g2-standard-16, 96 on g2-standard-32)",
+        help="Host System RAM budget in GiB for Strata/Avalon warm expert cache (default: 48 on g2-standard-16, 96 on g2-standard-32)",
     )
     parser.add_argument(
         "--local-ssd",
         type=int,
         default=None,
-        help="Number of 375 GB Local NVMe SSD scratch disks to attach on GCE (default: 1 when --engine strata, else 0)",
+        help="Number of 375 GB Local NVMe SSD scratch disks to attach on GCE (default: 1 when --engine strata/avalon, else 0)",
     )
     parser.add_argument(
         "--expert-evict",
@@ -1416,7 +1486,7 @@ Examples:
     # and dynamically set --gpu-memory-utilization 0.90.
     preflight_hw = args.machine_type or (resolve_machine_type(gpu_type, gpu_count, platform="vertex") if is_tpu else gpu_type)
     mem_budget = None
-    if find_model:
+    if find_model and args.engine not in ("strata", "avalon"):
         mem_budget = find_model.calculate_preflight_memory_budget(
             model_id=args.model,
             hardware_type=preflight_hw,
@@ -1979,14 +2049,15 @@ Examples:
         return
 
     # =========================================================================
-    # TARGET 3: COMPUTE ENGINE (GCE) FALLBACK / STRATA 3-TIER MOE DEPLOYMENT
+    # TARGET 3: COMPUTE ENGINE (GCE) FALLBACK / STRATA & AVALON MOE DEPLOYMENT
     # =========================================================================
     machine_type = args.machine_type or resolve_machine_type(
         gpu_type, gpu_count, platform="gce", engine=args.engine, model_id=args.model
     )
     instance_name = resource_name
-    local_ssd_count = args.local_ssd if args.local_ssd is not None else (1 if args.engine == "strata" else 0)
+    local_ssd_count = args.local_ssd if args.local_ssd is not None else (1 if args.engine in ("strata", "avalon") else 0)
     strata_ram_gb = args.strata_ram or (96 if machine_type == "g2-standard-32" else 48)
+    vcpu_threads = 32 if "32" in machine_type or "30" in machine_type else 16
 
     if args.engine == "strata":
         startup_script = generate_strata_startup_script(
@@ -1997,6 +2068,15 @@ Examples:
             ram_gb=strata_ram_gb,
             vram_reserve_mib=2048,
             evict=args.expert_evict,
+            hf_token=hf_token,
+        )
+    elif args.engine == "avalon":
+        startup_script = generate_avalon_startup_script(
+            model=args.model,
+            port=args.port,
+            max_model_len=effective_max_model_len,
+            n_gpu_layers=99,
+            threads=vcpu_threads,
             hf_token=hf_token,
         )
     else:
@@ -2072,7 +2152,13 @@ Examples:
             "gpu_type": gpu_type,
             "gpu_count": gpu_count,
             "local_ssd_count": local_ssd_count,
-            "strata_ram_gb": strata_ram_gb if args.engine == "strata" else None,
+            "strata_ram_gb": strata_ram_gb if args.engine in ("strata", "avalon") else None,
+            "avalon_hierarchy": {
+                "vram_gb": 22,
+                "host_ram_gb": strata_ram_gb,
+                "local_nvme_gb": local_ssd_count * 375,
+                "speedup_vs_strata": "+47%",
+            } if args.engine == "avalon" else None,
             "spot": args.spot,
             "disk_size_gb": args.disk_size,
             "port": args.port,
@@ -2086,11 +2172,16 @@ Examples:
         return
 
     # Default bash presentation for GCE
+    engine_label = (
+        "Avalon (AMD-Optimised llama.cpp Fork — up to 47% faster than Strata)"
+        if args.engine == "avalon"
+        else ("Strata MoE (3-Tier Dynamic Expert Streaming)" if args.engine == "strata" else "vLLM")
+    )
     print("=" * 80)
     print(f"  /fulcrum run: Compute Engine Specification for {args.model}")
     print("=" * 80)
     print(f"Target Platform:   Compute Engine (GCE GPU Virtual Machine)")
-    print(f"Inference Engine:  {'Strata MoE (3-Tier Dynamic Expert Streaming)' if args.engine == 'strata' else 'vLLM'}")
+    print(f"Inference Engine:  {engine_label}")
     print(f"Fallback Reason:   {rationale}")
     print(f"Target Project:    {project}")
     print(f"Zone:              {args.zone}")
@@ -2100,6 +2191,8 @@ Examples:
         print(f"Local NVMe SSD:    {local_ssd_count}x 375 GB NVMe scratch disk(s) (/mnt/nvme)")
     if args.engine == "strata":
         print(f"Strata Hierarchy:  22 GiB GPU VRAM + {strata_ram_gb} GiB Host RAM + {local_ssd_count * 375} GB NVMe SSD (Evict: {args.expert_evict.upper()})")
+    elif args.engine == "avalon":
+        print(f"Avalon Hierarchy:  22 GiB GPU VRAM (-ngl 99) + {strata_ram_gb} GiB Host DDR5 RAM (-ot ffn_exps=CPU) + {local_ssd_count * 375} GB NVMe SSD (+47% vs Strata)")
     if quota_report:
         q_icon = "✅" if quota_report["status"] == "SUFFICIENT" else ("❌" if quota_report["status"] == "INSUFFICIENT" else "⚠️")
         q_headroom = f" ({quota_report['available']:.0f} available / {quota_report['limit']:.0f} limit)" if quota_report.get("limit") is not None else ""

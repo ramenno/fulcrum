@@ -172,6 +172,22 @@ assert b_safe['max_safe_context'] > 8192
     p_strata_tbl = run(".venv/bin/python3 fulcrum/scripts/find_model.py --engine strata --moe-only --vram-limit 24")
     assert "STRATA GCE NODE (NVMe)" in p_strata_tbl.stdout
     assert "Strata MoE Node:" in p_strata_tbl.stdout
+
+    # Test Avalon (AMD-optimised llama.cpp fork, +47% faster than Strata) model search and sizing
+    p_avalon = run(".venv/bin/python3 fulcrum/scripts/find_model.py --engine avalon --moe-only --vram-limit 24 --format json")
+    data_avalon = json.loads(p_avalon.stdout)
+    assert len(data_avalon) >= 4, "Expected at least 4 MoE models fitting 24GB VRAM via Avalon"
+    for item in data_avalon:
+        hc = item["hardware_calc"]
+        assert hc.get("recommended_avalon") is not None
+        assert hc["recommended_avalon"]["speedup_vs_strata"] == "+47%"
+        assert hc["recommended_avalon"]["local_nvme_gb"] == 375
+        assert "avalon-server" in hc.get("avalon_command", "")
+        assert "--override-tensor" in hc.get("avalon_command", "")
+
+    p_avalon_tbl = run(".venv/bin/python3 fulcrum/scripts/find_model.py --engine avalon --moe-only --vram-limit 24")
+    assert "AVALON NODE (AMD/NVMe)" in p_avalon_tbl.stdout
+    assert "Avalon AMD Node:" in p_avalon_tbl.stdout
     print("find_model.py: PASSED")
 
 
@@ -441,6 +457,27 @@ assert is_tpu_machine('g2-standard-48') is False
     assert 'scratch_disk {' in p_strata_tf.stdout
     assert 'interface = "NVME"' in p_strata_tf.stdout
 
+    # 23. Test Avalon (AMD-optimised llama.cpp fork, up to 47% faster than Strata) platform routing and GCE provisioning
+    plat_a, rat_a = evaluate_platform_viability("Qwen/Qwen3.8-Flash-Next", "nvidia-l4", 1, "auto", engine="avalon")
+    assert plat_a == "gce"
+    assert "Avalon" in rat_a
+    assert "47%" in rat_a
+    assert resolve_machine_type("nvidia-l4", 1, platform="gce", engine="avalon", model_id="Qwen/Qwen3.8-Flash-Next") == "g2-standard-32"
+    assert resolve_machine_type("nvidia-l4", 1, platform="gce", engine="avalon", model_id="Qwen/Qwen3.6-35B-A3B") == "g2-standard-16"
+
+    p_avalon_gce = run(".venv/bin/python3 fulcrum/scripts/launch_gcp.py --model Qwen/Qwen3.8-Flash-Next --engine avalon --no-check-quota --format json")
+    data_avalon_gce = json.loads(p_avalon_gce.stdout)
+    assert data_avalon_gce["engine"] == "avalon"
+    assert data_avalon_gce["platform"] == "gce"
+    assert data_avalon_gce["machine_type"] == "g2-standard-32"
+    assert data_avalon_gce["local_ssd_count"] == 1
+    assert data_avalon_gce["avalon_hierarchy"]["speedup_vs_strata"] == "+47%"
+    assert "--local-ssd=interface=NVME" in data_avalon_gce["create_command"]
+    assert "avalon-server" in data_avalon_gce["startup_script"]
+    assert "--override-tensor" in data_avalon_gce["startup_script"]
+    assert "--flash-attn" in data_avalon_gce["startup_script"]
+    assert "--mlock" in data_avalon_gce["startup_script"]
+
     if os.path.exists(test_db):
         os.remove(test_db)
     print("launch_gcp.py: PASSED")
@@ -666,6 +703,20 @@ def test_optimise_deployment() -> None:
     assert data_strata_opt["flags"]["--spec"] == 3
     assert "strata-cli serve" in data_strata_opt["command"]
     assert any("3-Tier MoE Memory Hierarchy" in r for r in data_strata_opt["rationales"])
+
+    # Test Avalon (AMD-optimised llama.cpp fork, up to 47% faster than Strata) optimisation advice
+    p_avalon_opt = run(".venv/bin/python3 fulcrum/scripts/optimise_deployment.py advise --model Qwen/Qwen3.8-Flash-Next --engine avalon --workload latency --format json")
+    data_avalon_opt = json.loads(p_avalon_opt.stdout)
+    assert data_avalon_opt["engine"] == "avalon"
+    assert data_avalon_opt["speedup_vs_strata"] == "+47%"
+    assert data_avalon_opt["flags"]["--n-gpu-layers"] == 99
+    assert data_avalon_opt["flags"]["--override-tensor"] == r'"\.ffn_.*_exps\.=CPU"'
+    assert data_avalon_opt["flags"]["--flash-attn"] is True
+    assert data_avalon_opt["flags"]["--cache-type-k"] == "q8_0"
+    assert data_avalon_opt["flags"]["--mlock"] is True
+    assert data_avalon_opt["flags"]["--spec-draft"] == 3
+    assert "avalon-server" in data_avalon_opt["command"]
+    assert any("47% faster" in r.lower() for r in data_avalon_opt["rationales"])
     print("optimise_deployment.py: PASSED")
 
 

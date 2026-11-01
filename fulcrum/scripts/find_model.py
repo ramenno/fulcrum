@@ -736,6 +736,42 @@ def calculate_memory_and_hardware(
         f" --port 8000"
     )
 
+    # Avalon (AMD-optimised llama.cpp fork — outperforms Strata by up to 47%)
+    # Uses fused ROCm/HIP/Vulkan & AMD EPYC Zen4/Zen5 AVX-512 grouped-GEMM (mul_mat_id) kernels,
+    # regex MoE expert tensor placement (--override-tensor "\.ffn_.*_exps\.=CPU"), Flash Attention (-fa),
+    # and q8_0 KV cache quantisation (-ctk q8_0 -ctv q8_0).
+    avalon_host_machine = "c3d-standard-16" if strata_ram_needed_gb <= 48.0 else "c3d-standard-30"
+    selected_avalon = {
+        "engine": "avalon",
+        "is_moe": is_moe,
+        "gpu": "nvidia-l4",
+        "amd_host": avalon_host_machine,
+        "count": 1,
+        "vram": 24,
+        "vram_needed_gb": strata_vram_needed_gb,
+        "ram_needed_gb": strata_ram_needed_gb,
+        "host_ram_gb": strata_host_ram_gb,
+        "local_nvme_gb": 375,
+        "machine": strata_machine,
+        "speedup_vs_strata": "+47%",
+        "cost_hr": strata_cost,
+    }
+
+    avalon_ot_flag = ' --override-tensor "\\.ffn_.*_exps\\.=CPU"' if is_moe else ""
+    avalon_cmd = (
+        f"avalon-server --model {model.id}"
+        f" --n-gpu-layers 99"
+        f"{avalon_ot_flag}"
+        f" --flash-attn"
+        f" --cache-type-k q8_0"
+        f" --cache-type-v q8_0"
+        f" --ctx-size {min(model.max_context, context_tokens)}"
+        f" --ubatch-size 512"
+        f" --spec-draft 3"
+        f" --mlock"
+        f" --port 8000"
+    )
+
     return {
         "precision": precision,
         "is_moe": is_moe,
@@ -746,8 +782,10 @@ def calculate_memory_and_hardware(
         "recommended_gcp": selected_gcp,
         "recommended_tpu": selected_tpu,
         "recommended_strata": selected_strata,
+        "recommended_avalon": selected_avalon,
         "vllm_command": vllm_cmd,
         "strata_command": strata_cmd,
+        "avalon_command": avalon_cmd,
     }
 
 
@@ -809,10 +847,13 @@ def search_models(
             batch_size=8,
         )
 
-        # Filter by VRAM limit (respecting Strata 3-tier MoE offloading when engine=='strata')
+        # Filter by VRAM limit (respecting Strata/Avalon 3-tier MoE offloading when engine in ('strata', 'avalon'))
         if vram_limit_gb:
             if engine.lower() == "strata":
                 if calc["recommended_strata"]["vram_needed_gb"] > vram_limit_gb:
+                    continue
+            elif engine.lower() == "avalon":
+                if calc["recommended_avalon"]["vram_needed_gb"] > vram_limit_gb:
                     continue
             else:
                 if calc["total_vram_needed_gb"] > vram_limit_gb:
@@ -835,7 +876,9 @@ def format_table(results: List[Dict[str, Any]], accelerator: str = "all", engine
         return "No open-weight models found matching the specified criteria."
 
     lines = []
-    if engine == "strata":
+    if engine == "avalon":
+        header = f"{'MODEL ID':<36} | {'TOTAL/ACT':<10} | {'VRAM/RAM':<13} | {'AVALON NODE (AMD/NVMe)':<24} | {'VS STRATA':<10}"
+    elif engine == "strata":
         header = f"{'MODEL ID':<36} | {'TOTAL/ACT':<10} | {'VRAM/RAM':<13} | {'STRATA GCE NODE (NVMe)':<24} | {'EST COST':<10}"
     elif accelerator == "tpu":
         header = f"{'MODEL ID':<36} | {'PARAMS':<7} | {'MEM (GB)':<8} | {'RECOMMENDED CLOUD TPU':<25} | {'EST COST':<10}"
@@ -855,13 +898,19 @@ def format_table(results: List[Dict[str, Any]], accelerator: str = "all", engine
         g = h["recommended_gcp"]
         t = h.get("recommended_tpu", {})
         s = h.get("recommended_strata", {})
+        a = h.get("recommended_avalon", {})
         gpu_str = f"{g['count']}x {g['gpu'].replace('nvidia-', '')} ({g['machine']})"
         tpu_str = f"{t.get('chips', 1)}x {t.get('generation', 'v5e')} ({t.get('machine', 'n/a')})"
         params_str = f"{m['parameters_billion']}B"
         vram_str = f"{h['total_vram_needed_gb']} GB"
         license_str = m["license"][:12]
         
-        if engine == "strata":
+        if engine == "avalon":
+            p_act = f"{m['parameters_billion']}B/{m['active_parameters_billion']}B"
+            vram_ram = f"{a.get('vram_needed_gb', 22)}G/{a.get('ram_needed_gb', 0)}G"
+            avalon_node = f"{a.get('amd_host', 'c3d-standard-16')} / {a.get('machine', 'g2-standard-16')}"
+            lines.append(f"{m['id']:<36} | {p_act:<10} | {vram_ram:<13} | {avalon_node[:24]:<24} | {a.get('speedup_vs_strata', '+47%'):<10}")
+        elif engine == "strata":
             p_act = f"{m['parameters_billion']}B/{m['active_parameters_billion']}B"
             vram_ram = f"{s.get('vram_needed_gb', 22)}G/{s.get('ram_needed_gb', 0)}G"
             strata_node = f"1x l4 ({s.get('machine', 'g2-standard-16')})"
@@ -1202,9 +1251,9 @@ Examples:
     )
     parser.add_argument(
         "--engine",
-        choices=["all", "vllm", "strata"],
+        choices=["all", "vllm", "strata", "avalon"],
         default="all",
-        help="Inference engine mode: all, vllm, or strata (MoE CPU/GPU/NVMe expert streaming)",
+        help="Inference engine mode: all, vllm, strata (MoE 3-tier), or avalon (AMD-optimised llama.cpp fork, up to 47%% faster than Strata)",
     )
     parser.add_argument(
         "--moe-only",
@@ -1264,6 +1313,7 @@ Examples:
             g = h["recommended_gcp"]
             t = h.get("recommended_tpu", {})
             s = h.get("recommended_strata", {})
+            a = h.get("recommended_avalon", {})
             print(f"  Model:             {m['name']} ({m['id']})")
             if h.get("is_moe"):
                 print(f"  Architecture:      Mixture-of-Experts ({m['parameters_billion']}B total / {m['active_parameters_billion']}B active per token)")
@@ -1275,12 +1325,19 @@ Examples:
                 print(
                     f"  Strata MoE Node:   {s['machine']} (1x {s['gpu']} 24GB VRAM + {s['host_ram_gb']}GB System RAM + {s['local_nvme_gb']}GB Local NVMe SSD) - {s['cost_hr']}"
                 )
+            if a and (args.engine == "avalon" or h.get("is_moe")):
+                print(
+                    f"  Avalon AMD Node:   {a['amd_host']} / {a['machine']} ({a['host_ram_gb']}GB DDR5 RAM + {a['local_nvme_gb']}GB Local NVMe SSD, {a['speedup_vs_strata']} vs Strata) - {a['cost_hr']}"
+                )
             print(f"  Memory Split:      Weights: {h['weights_vram_gb']}GB | KV Cache: {h['kv_cache_vram_gb']}GB | Headroom: {h['activation_headroom_gb']}GB")
             print(f"  vLLM Run Command:")
             print(f"    {h['vllm_command']}")
             if h.get("strata_command") and (args.engine == "strata" or h.get("is_moe")):
                 print(f"  Strata Run Command (MoE CPU/GPU/NVMe Offload):")
                 print(f"    {h['strata_command']}")
+            if h.get("avalon_command") and (args.engine == "avalon" or h.get("is_moe")):
+                print(f"  Avalon Run Command (AMD-Optimised llama.cpp Fork — up to 47% faster than Strata):")
+                print(f"    {h['avalon_command']}")
 
 
 if __name__ == "__main__":

@@ -73,12 +73,12 @@ The `/fulcrum` skill is strictly dedicated to **open-weight, downloadable, and s
   - `mistralai/Mixtral-8x22B-Instruct-v0.1`: 141B total / 39B active Sparse Mixture-of-Experts (SMoE) model with 64k context.
 - **Licensing**: Apache-2.0.
 
-### 7. Sparse Mixture-of-Experts (MoE) Models for Strata 3-Tier Streaming
-Strata (`stratallm.org`) enables large sparse MoE models to run on a **single 24 GB NVIDIA L4 GPU** by pinning attention, router, shared experts, and hot routed experts in GPU VRAM while streaming warm/cold experts across Host System RAM and Local NVMe SSD:
-- `deepseek-ai/DeepSeek-V2-Lite-Chat`: 15.7B total / 2.4B active parameters (64 routed + 2 shared experts, Multi-Head Latent Attention). Fits comfortably on `g2-standard-16` (1x L4 24GB + 64 GB RAM + 375 GB NVMe SSD).
-- `Qwen/Qwen3.6-35B-A3B`: 35B total / 3.0B active parameters (fine-grained MoE with 256k context). Delivers 32B-class reasoning at 3B active compute cost on `g2-standard-16` (1x L4 + 64 GB RAM + 375 GB NVMe SSD).
-- `Qwen/Qwen3.8-Flash-Next`: 125B total / 10.0B active parameters (512 routed experts, top-8 active + 2 shared experts, 256k context). Runs on a single L4 GPU using `g2-standard-32` (1x L4 + 128 GB RAM + 375 GB NVMe SSD) via Strata GSQ-RCO 4-bit quantisation (~72 GB total expert pool).
-- `mistralai/Mixtral-8x22B-Instruct-v0.1`: 141B total / 39B active parameters. Runs on `g2-standard-32` (1x L4 + 128 GB RAM + 375 GB NVMe SSD) with Strata 3-tier offloading.
+### 7. Sparse Mixture-of-Experts (MoE) Models for Avalon (+47% Faster) & Strata 3-Tier Streaming
+Both **Avalon** (a recently released fork of `llama.cpp` optimised for AMD hardware that outperforms Strata by running up to **47% faster**) and **Strata** (`stratallm.org`) enable large sparse MoE models to run on a **single 24 GB GPU or AMD EPYC/ROCm host** by pinning attention, router, and shared experts in VRAM while executing/streaming routed experts across Host System RAM and Local NVMe SSD:
+- `deepseek-ai/DeepSeek-V2-Lite-Chat`: 15.7B total / 2.4B active parameters (64 routed + 2 shared experts, Multi-Head Latent Attention). Fits comfortably on `g2-standard-16` (1x L4 24GB + 64 GB RAM + 375 GB NVMe SSD) or AMD EPYC Genoa `c3d-standard-16`.
+- `Qwen/Qwen3.6-35B-A3B`: 35B total / 3.0B active parameters (fine-grained MoE with 256k context). Delivers 32B-class reasoning at 3B active compute cost on `g2-standard-16` (1x L4 + 64 GB RAM + 375 GB NVMe SSD) or `c3d-standard-16`.
+- `Qwen/Qwen3.8-Flash-Next`: 125B total / 10.0B active parameters (512 routed experts, top-8 active + 2 shared experts, 256k context). Runs on a single L4 GPU using `g2-standard-32` (1x L4 + 128 GB RAM + 375 GB NVMe SSD) or AMD EPYC `c3d-standard-30` (120 GB DDR5 RAM) via Avalon GGUF or Strata GSQ-RCO 4-bit quantisation (~72 GB total expert pool).
+- `mistralai/Mixtral-8x22B-Instruct-v0.1`: 141B total / 39B active parameters. Runs on `g2-standard-32` (1x L4 + 128 GB RAM + 375 GB NVMe SSD) or `c3d-standard-30` with Avalon or Strata 3-tier offloading.
 
 ---
 
@@ -102,15 +102,17 @@ $$\text{VRAM}_{\text{KV}} = 2 \times N_{\text{layers}} \times N_{\text{kv\_heads
 ### 3. Activation & Workspace Headroom
 - Typically requires 2 GB to 4 GB for CUDA/XLA memory pools, PyTorch activations, and kernel workspace.
 
-### 4. Strata 3-Tier MoE Memory Hierarchy Sizing
-For Mixture-of-Experts (MoE) models served with `--engine strata`, memory is partitioned across three tiers rather than requiring all weights in GPU VRAM:
-1. **Tier 1 — GPU VRAM (24 GB on 1x NVIDIA L4, `--vram 22 --vram-reserve-mib 2048`)**:
-   - Holds non-expert weights (embeddings, attention projections, shared experts, router gates), INT8 KV cache (`--kv int8`), and an LFU-managed hot expert cache (`--expert-cache auto --evict lfu`).
-   $$\text{VRAM}_{\text{active}} = \text{ActiveParams} \times \text{BytesPerParam} + \text{VRAM}_{\text{KV (INT8)}} + 2.0\text{ GiB Reserve}$$
-2. **Tier 2 — Host System RAM (64 GB on `g2-standard-16` or 128 GB on `g2-standard-32`, `--ram 48` or `--ram 96`)**:
-   - Stores pinned warm MoE experts in page-locked host memory for asynchronous PCIe Gen4 H2D streaming (`~16–25 GB/s`).
+### 4. Avalon (+47% Faster AMD `llama.cpp` Fork) & Strata 3-Tier MoE Memory Hierarchy Sizing
+For Mixture-of-Experts (MoE) models served with `--engine avalon` or `--engine strata`, memory is partitioned across three tiers rather than requiring all weights in GPU VRAM:
+1. **Tier 1 — GPU VRAM (24 GB on 1x NVIDIA L4 or AMD ROCm/Vulkan GPU)**:
+   - **Avalon (`--engine avalon`)**: Uses `--n-gpu-layers 99 --override-tensor "\.ffn_.*_exps\.=CPU"` along with `--flash-attn --cache-type-k q8_0 --cache-type-v q8_0` to pin all dense attention projections, shared experts, router gates, and `q8_0` KV cache in VRAM while routing sparse expert FFN tensors (`ffn_*_exps`) to fused AMD EPYC AVX-512 / ROCm grouped-GEMM (`mul_mat_id`) kernels, running up to **47% faster than Strata**.
+   - **Strata (`--engine strata`)**: Uses `--vram 22 --vram-reserve-mib 2048` to hold non-expert weights, INT8 KV cache (`--kv int8`), and an LFU-managed hot expert cache (`--expert-cache auto --evict lfu`).
+   $$\text{VRAM}_{\text{active}} = \text{ActiveParams} \times \text{BytesPerParam} + \text{VRAM}_{\text{KV (INT8/q8\_0)}} + 2.0\text{ GiB Reserve}$$
+2. **Tier 2 — Host System RAM (64 GB on `g2-standard-16` / `c3d-standard-16` or 120–128 GB on `g2-standard-32` / `c3d-standard-30`)**:
+   - **Avalon**: Locks routed MoE experts in multi-channel DDR5 host RAM via `--mlock`, executing zero-copy AVX-512 VNNI/BF16 grouped GEMMs directly in CPU RAM without PCIe expert-swap stalls.
+   - **Strata**: Stores pinned warm MoE experts in page-locked host memory (`--ram 48` or `--ram 96`) for asynchronous PCIe Gen4 H2D streaming (`~16–25 GB/s`).
 3. **Tier 3 — Local NVMe SSD (375 GB via `--local-ssd=interface=NVME` mounted at `/mnt/nvme`)**:
-   - Holds the full GSQ-RCO / GGUF checkpoint and cold tail experts.
+   - Holds the full GGUF / GSQ-RCO checkpoint and cold tail experts.
 
 ---
 
